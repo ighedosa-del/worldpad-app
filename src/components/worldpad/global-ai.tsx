@@ -2,11 +2,10 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { useWorldpadStore } from '@/lib/store';
-import { useTradeExecution } from '@/hooks/use-trade-execution';
 import {
   startMultiMarketScan, stopMultiMarketScan, getAllMarketData,
   isScannerConnected, addTickCallback, getScannerHealth,
-  SCANNED_MARKETS, type MarketData, type MarketSymbol, type MarketTickData,
+  SCANNED_MARKETS, type MarketSymbol,
 } from '@/lib/multi-market-ws';
 import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
@@ -16,9 +15,6 @@ import { isSimulating } from '@/lib/deriv-ws';
  * GlobalAI — invisible background component that runs the AI brain globally.
  * Mounted once in page.tsx. Scans all 10 markets, scores them, auto-trades,
  * and learns — regardless of which tab the user is on.
- *
- * All trades from ANY tab (manual, bot, draft) feed back into AI learning
- * via the Zustand store's addTradeResult + recordTradeResult.
  */
 export function GlobalAI() {
   const {
@@ -26,15 +22,12 @@ export function GlobalAI() {
     setGlobalAIRunning, setGlobalAIRankedMarkets, setGlobalAIStatus,
     setGlobalAICycleCount, setGlobalAITotalTrades, setGlobalAITotalProfit,
     setGlobalAILearningStats, setGlobalAIHealth,
-    globalAIRunning,
   } = useWorldpadStore();
-
-  const { placeTrade } = useTradeExecution();
 
   const runningRef = useRef(false);
   const cycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeTradesRef = useRef<Map<string, { signal: any; startedAt: number }>>(new Map());
-  const tradeLockRef = useRef(false);
+  const tradeLocksRef = useRef<Set<string>>(new Set()); // per-market locks
   const totalProfitRef = useRef(0);
   const totalTradesRef = useRef(0);
   const cycleCountRef = useRef(0);
@@ -74,10 +67,11 @@ export function GlobalAI() {
     return unsubscribe;
   }, [updateRankingThrottled]);
 
-  // === Trade execution ===
+  // === Trade execution (waits for next tick in sim mode) ===
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
-    if (!market.selectedSignal || tradeLockRef.current) return;
-    tradeLockRef.current = true;
+    if (!market.selectedSignal) return;
+    if (tradeLocksRef.current.has(market.symbol)) return;
+    tradeLocksRef.current.add(market.symbol);
 
     try {
       const signal = market.selectedSignal;
@@ -86,13 +80,11 @@ export function GlobalAI() {
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
 
-      const result = await placeTrade({
+      const result = await placeTradeDirect({
         contractType: signal.contractType,
         barrier: signal.barrier,
         stake,
         symbol: market.symbol,
-        duration: 1,
-        durationUnit: 't',
       });
 
       if (result) {
@@ -131,9 +123,9 @@ export function GlobalAI() {
       addAutoTraderLog(`[AI] Error on ${market.name}: ${(err as Error).message}`);
     } finally {
       activeTradesRef.current.delete(market.symbol);
-      tradeLockRef.current = false;
+      tradeLocksRef.current.delete(market.symbol);
     }
-  }, [placeTrade, addAutoTraderLog, addTradeResult, setGlobalAITotalTrades, setGlobalAITotalProfit, setGlobalAILearningStats]);
+  }, [addAutoTraderLog, addTradeResult, setGlobalAITotalTrades, setGlobalAITotalProfit, setGlobalAILearningStats]);
 
   // === Main AI cycle ===
   const runCycle = useCallback(async () => {
@@ -150,9 +142,10 @@ export function GlobalAI() {
     cycleCountRef.current += 1;
     if (mountedRef.current) setGlobalAICycleCount(cycleCountRef.current);
 
-    for (const trade of trades) {
-      await executeTradeOnMarket(trade, botConfig.stake);
-    }
+    // Fire all trades in parallel (per-market locks prevent duplicates)
+    const promises = trades.map(trade => executeTradeOnMarket(trade, botConfig.stake));
+    await Promise.all(promises);
+
     setGlobalAIStatus('waiting');
   }, [executeTradeOnMarket, botConfig.stake, setGlobalAIStatus, setGlobalAICycleCount]);
 
@@ -165,6 +158,7 @@ export function GlobalAI() {
     totalTradesRef.current = 0;
     cycleCountRef.current = 0;
     activeTradesRef.current.clear();
+    tradeLocksRef.current.clear();
     setGlobalAIRunning(true);
     setGlobalAICycleCount(0);
     setGlobalAITotalTrades(0);
@@ -173,13 +167,13 @@ export function GlobalAI() {
     const simMode = isSimulating() || !isAuthorized;
     addAutoTraderLog(`[AI] === GLOBAL AI STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Trading ALL markets with signals`);
+    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 10 | Max concurrent: 10`);
 
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
       if (runningRef.current) {
-        cycleTimerRef.current = setTimeout(runLoop, 2500);
+        cycleTimerRef.current = setTimeout(runLoop, 3000);
       }
     };
     runLoop();
@@ -191,6 +185,9 @@ export function GlobalAI() {
     setGlobalAIStatus('idle');
     if (cycleTimerRef.current) { clearTimeout(cycleTimerRef.current); cycleTimerRef.current = null; }
     activeTradesRef.current.clear();
+    tradeLocksRef.current.clear();
+    // Clear any pending sim trades
+    pendingSimTradesGlobal.clear();
     addAutoTraderLog(`[AI] === GLOBAL AI STOPPED === | Cycles: ${cycleCountRef.current} | Trades: ${totalTradesRef.current} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     aiEngine.saveLearningData();
   }, [addAutoTraderLog, setGlobalAIRunning, setGlobalAIStatus]);
@@ -253,11 +250,10 @@ export function GlobalAI() {
       (history) => {
         if (history.length === 0) return;
         const last = history[history.length - 1];
-        // Only record non-AI trades (AI trades are already recorded)
         if (last.id.startsWith('ai-')) return;
         aiEngine.recordTradeResult(
           last.symbol, last.type, last.digit >= 0 ? last.digit : undefined,
-          last.profit, 50 // moderate signal strength for manual trades
+          last.profit, 50
         );
       }
     );
@@ -266,4 +262,124 @@ export function GlobalAI() {
 
   // This component renders nothing — it's purely a background service
   return null;
+}
+
+// === Direct trade function (bypasses useTradeExecution hook to avoid React issues) ===
+import { addTickCallback as addTickListener } from '@/lib/multi-market-ws';
+import type { TradeResult } from '@/hooks/use-trade-execution';
+
+// Pending simulation trades awaiting next tick
+const pendingSimTradesGlobal: Map<string, {
+  contractType: string;
+  barrier: number | undefined;
+  stake: number;
+  symbol: string;
+  resolve: (result: TradeResult | null) => void;
+}> = new Map();
+
+let globalTickListenerRegistered = false;
+
+function registerGlobalTickListener() {
+  if (globalTickListenerRegistered) return;
+  globalTickListenerRegistered = true;
+
+  addTickListener((symbol, data) => {
+    const pending = pendingSimTradesGlobal.get(symbol);
+    if (!pending || !data.lastTick) return;
+
+    const nextDigit = data.lastTick.digit;
+    pendingSimTradesGlobal.delete(symbol);
+
+    const { contractType, barrier, stake, symbol: tradeSymbol } = pending;
+    let won = false;
+    switch (contractType) {
+      case 'DIGITMATCH': won = nextDigit === barrier; break;
+      case 'DIGITDIFF': won = nextDigit !== barrier; break;
+      case 'DIGITOVER': won = nextDigit > (barrier ?? 4); break;
+      case 'DIGITUNDER': won = nextDigit < (barrier ?? 5); break;
+      case 'DIGITEVEN': won = nextDigit % 2 === 0; break;
+      case 'DIGITODD': won = nextDigit % 2 === 1; break;
+      default: won = Math.random() > 0.5;
+    }
+
+    const isMatch = contractType === 'DIGITMATCH';
+    const payout = won ? stake * (isMatch ? 8.5 : 0.85) : 0;
+    const profit = payout - stake;
+
+    const result: TradeResult = {
+      id: `SIM-${Date.now()}`,
+      type: contractType,
+      symbol: tradeSymbol,
+      stake,
+      payout,
+      profit,
+      digit: barrier ?? -1,
+      won,
+      timestamp: Date.now(),
+      simulated: true,
+    };
+
+    pending.resolve(result);
+  });
+}
+
+export function clearPendingSimTrades() {
+  pendingSimTradesGlobal.clear();
+}
+
+async function placeTradeDirect(params: {
+  contractType: string;
+  barrier?: number;
+  stake: number;
+  symbol: string;
+}): Promise<TradeResult | null> {
+  const { isSimulating: checkSim, getProposalWS, buyContractWS } = await import('@/lib/deriv-ws');
+  const simMode = checkSim() || !useWorldpadStore.getState().isAuthorized;
+
+  if (simMode) {
+    // Wait for NEXT tick
+    if (pendingSimTradesGlobal.has(params.symbol)) return null;
+
+    return new Promise<TradeResult | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        pendingSimTradesGlobal.delete(params.symbol);
+        resolve(null);
+      }, 15000);
+
+      registerGlobalTickListener();
+      pendingSimTradesGlobal.set(params.symbol, {
+        ...params,
+        resolve: (r) => { clearTimeout(timeout); resolve(r); },
+      });
+    });
+  }
+
+  // LIVE mode
+  try {
+    const proposal = await getProposalWS({
+      contractType: params.contractType,
+      symbol: params.symbol,
+      stake: params.stake,
+      barrier: params.barrier,
+      duration: 1,
+      durationUnit: 't',
+    });
+    const buyResult = await buyContractWS(proposal.id, proposal.ask_price);
+    const won = buyResult.profit > 0;
+    return {
+      id: buyResult.contract_id,
+      type: params.contractType,
+      symbol: params.symbol,
+      stake: params.stake,
+      payout: buyResult.payout,
+      profit: buyResult.profit,
+      digit: params.barrier ?? -1,
+      won,
+      timestamp: Date.now(),
+      simulated: false,
+    };
+  } catch (err) {
+    console.error('[GlobalAI] Live trade error:', err);
+    return null;
+  }
 }
