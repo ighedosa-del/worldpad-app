@@ -9,6 +9,7 @@ import {
 } from '@/lib/multi-market-ws';
 import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
+import { calculateStake, recordRiskResult, resetRiskStates, getSessionPL } from '@/lib/risk-manager';
 import { isSimulating, getProposalWS, buyContractWS } from '@/lib/deriv-ws';
 import type { TradeResult } from '@/hooks/use-trade-execution';
 import { clearPendingSimTrades } from '@/hooks/use-trade-execution';
@@ -129,7 +130,8 @@ async function placeTradeDirect(params: {
  * GlobalAI v2 — invisible background component that runs the AI brain globally.
  * Mounted once in page.tsx. Scans all 10 markets, scores them, auto-trades,
  * and learns — regardless of which tab the user is on.
- * v2: EV filtering, stop-loss, per-market cooldown, consensus, MATCH penalty
+ * v4: Full system — Pattern Library + Regime Filter + Backtesting +
+ * Strategy Rotation + Kelly Staking + EV filtering + stop-loss + cooldowns
  */
 
 // v2: Per-market loss cooldown tracker (shared with use-ai-bot)
@@ -226,8 +228,13 @@ export function GlobalAI() {
 
     try {
       const signal = market.selectedSignal;
-      const evStr = market.evAdjusted ? ` [EV:${market.expectedValue.toFixed(3)}]` : '';
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}${evStr}`;
+      // v4: Dynamic stake via Kelly criterion
+      const { stake: kellyStake, reason: stakeReason } = calculateStake(
+        market.symbol, signal.contractType, 0.90, { baseStake: stake }
+      );
+      const finalStake = kellyStake > 0 ? kellyStake : stake;
+
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)} | ${stakeReason}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -235,7 +242,7 @@ export function GlobalAI() {
       const result = await placeTradeDirect({
         contractType: signal.contractType,
         barrier: signal.barrier,
-        stake,
+        stake: finalStake,
         symbol: market.symbol,
       });
 
@@ -262,12 +269,15 @@ export function GlobalAI() {
           result.profit, market.combinedScore
         );
 
+        // v4: Record to risk manager
+        recordRiskResult(market.symbol, result.profit);
+
         addTradeResult({
           id: `ai-${Date.now()}-${market.symbol}`,
           type: signal.contractType,
           symbol: market.symbol,
-          stake,
-          payout: result.payout || stake * 0.85,
+          stake: finalStake,
+          payout: result.payout || finalStake * 0.85,
           profit: result.profit,
           digit: signal.barrier ?? -1,
           won,
@@ -339,6 +349,7 @@ export function GlobalAI() {
     lossCooldownsGlobal.clear();
     sessionWinsRef.current = 0;
     sessionLossesRef.current = 0;
+    resetRiskStates(); // v4: reset Kelly staking
 
     aiEngine.loadLearningData();
     setGlobalAILearningStats(aiEngine.getLearningStats());
@@ -355,10 +366,10 @@ export function GlobalAI() {
 
     const simMode = isSimulating() || !isAuthorized;
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === GLOBAL AI v2 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
+    addAutoTraderLog(`[AI] === GLOBAL AI v4 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score: 30 | Max concurrent: 10`);
-    addAutoTraderLog(`[AI] v2: EV filter ON | MATCH penalty ON | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks | Consensus ON`);
+    addAutoTraderLog(`[AI] Logic 50% + AI 30% + Patterns 20% | Regime filter ON | Backtest ON`);
+    addAutoTraderLog(`[AI] Kelly staking | Strategy rotation | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks`);
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
 
     const runLoop = async () => {
@@ -381,7 +392,7 @@ export function GlobalAI() {
     tradeLocksRef.current.clear();
     pendingSimTradesGlobal.clear();
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === GLOBAL AI v2 STOPPED ===`);
+    addAutoTraderLog(`[AI] === GLOBAL AI v4 STOPPED ===`);
     addAutoTraderLog(`[AI] Cycles: ${cycleCountRef.current} | Trades: ${totalTradesRef.current} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     addAutoTraderLog(`[AI] Session W/L: ${sessionWinsRef.current}/${sessionLossesRef.current}`);
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);

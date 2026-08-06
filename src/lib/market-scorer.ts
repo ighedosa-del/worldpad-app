@@ -3,10 +3,13 @@
 import type { MarketData, MarketSymbol } from './multi-market-ws';
 import { scoreMarketLogic, LogicScore, TradeSignal } from './logic-engine';
 import { aiEngine, AIScore } from './ai-engine';
+import { analyzePatterns } from './pattern-library';
+import { analyzeRegime, type RegimeResult } from './market-regime';
+import { quickBacktestDiff } from './backtest-engine';
 
-// === Market Scorer v3 ===
-// HARD RULE: Only DIGITDIFF (90% win, +EV) and rarely DIGITMATCH (10% win, 8.5x payout).
-// DIGITOVER/UNDER/EVEN/ODD are BLOCKED — they're 50/50 with only 0.85x payout = -EV always.
+// === Market Scorer v4 ===
+// Integrates: Logic Engine + AI Engine + Pattern Library + Regime Filter + Backtesting
+// Only trades DIGITDIFF (90%+ win) with regime/pattern/backtest validation.
 
 export interface RankedMarket {
   symbol: MarketSymbol;
@@ -18,6 +21,9 @@ export interface RankedMarket {
   selectedSignal: TradeSignal | null;
   expectedValue: number;
   evAdjusted: boolean;
+  regime: RegimeResult | null;
+  patternScore: number;
+  backtestGrade: string | null;
   rank: number;
 }
 
@@ -29,65 +35,105 @@ export interface ScoringConfig {
 }
 
 const DEFAULT_CONFIG: ScoringConfig = {
-  logicWeight: 0.6,
-  aiWeight: 0.4,
-  minScore: 20,           // v3: lowered from 30 — DIFF signals are common
+  logicWeight: 0.5,
+  aiWeight: 0.3,
+  minScore: 15,
   maxConcurrentTrades: 10,
 };
 
-// Contracts that are PROFITABLE to trade (real edge, not 50/50 house bets)
-const ALLOWED_CONTRACTS = new Set(['DIGITDIFF', 'DIGITMATCH']);
-
-// 50/50 bets with negative EV — ALWAYS blocked regardless of score or confidence
 const BLOCKED_CONTRACTS = new Set(['DIGITOVER', 'DIGITUNDER', 'DIGITEVEN', 'DIGITODD']);
 
-// === Real EV calculation (no fake confidence boost) ===
-calculateEV(signal: TradeSignal): number {
-  if (signal.contractType === 'DIGITDIFF') {
-    // 90% real win rate, 0.85x profit
-    return (0.90 * 0.85) - (0.10 * 1.0); // = +0.665
-  }
-  if (signal.contractType === 'DIGITMATCH') {
-    // 10% base, but confidence indicates how much the AI leans toward this digit
-    // Need >11.8% win rate to break even (payout 8.5x net, cost 1x)
-    // Breakeven: p * 8.5 = (1-p) * 1 → p = 1/9.5 = 10.53%
-    // We use confidence as an edge indicator: real_prob ≈ 10% + confidence * 10%
-    const adjustedProb = 0.10 + signal.confidence * 0.10; // max 20% at full confidence
-    return (adjustedProb * 8.5) - ((1 - adjustedProb) * 1.0);
-  }
-  return -1; // blocked contracts
-}
-
 // === Convert any blocked signal to DIGITDIFF ===
-function convertToDiff(signal: TradeSignal, reason: string): TradeSignal {
+function convertToDiff(signal: TradeSignal, reason: string, barrier?: number): TradeSignal {
   return {
     contractType: 'DIGITDIFF',
-    barrier: signal.barrier,
-    reason: `[CONVERTED→DIFF] ${reason}: ${signal.contractType} d${signal.barrier ?? '-'} is a 50/50 bet (-EV)`,
-    confidence: 0.7, // DIFF has inherent 90% edge
+    barrier: barrier ?? signal.barrier,
+    reason: `[→DIFF] ${reason}: ${signal.contractType} is 50/50 (-EV)`,
+    confidence: 0.7,
   };
 }
 
-// === Signal consensus ===
-function getConsensusSignal(logicSignal: TradeSignal | null, aiSignal: TradeSignal | null): { signal: TradeSignal | null; consensus: boolean } {
-  if (!logicSignal && !aiSignal) return { signal: null, consensus: false };
-  if (!logicSignal) return { signal: aiSignal, consensus: false };
-  if (!aiSignal) return { signal: logicSignal, consensus: false };
+// === Pick the best DIGITDIFF barrier from multiple sources ===
+function pickBestDiffBarrier(
+  logicSignal: TradeSignal | null,
+  aiSignal: TradeSignal | null,
+  patternSignal: { contractType: string; barrier?: number; reason: string; confidence: number } | null,
+  data: MarketData,
+): TradeSignal | null {
+  const candidates: { barrier: number; confidence: number; reason: string; source: string }[] = [];
 
-  // Both exist — check if they agree on contract type
-  if (logicSignal.contractType === aiSignal.contractType) {
-    const boosted = {
-      ...logicSignal,
-      confidence: Math.min(logicSignal.confidence + 0.15, 1.0),
-      reason: `[CONSENSUS] ${logicSignal.contractType} — both engines agree: ${logicSignal.reason} | ${aiSignal.reason}`,
-    };
-    return { signal: boosted, consensus: true };
+  // Collect barriers from all sources
+  if (logicSignal) {
+    const b = logicSignal.barrier;
+    if (b !== undefined && b !== null) {
+      candidates.push({ barrier: b, confidence: logicSignal.confidence * 0.8, reason: logicSignal.reason, source: 'Logic' });
+    }
   }
 
-  // No consensus — use higher confidence signal
-  const best = logicSignal.confidence >= aiSignal.confidence ? logicSignal : aiSignal;
-  if (best.confidence < 0.3) return { signal: null, consensus: false };
-  return { signal: best, consensus: false };
+  if (aiSignal) {
+    const b = aiSignal.barrier;
+    if (b !== undefined && b !== null) {
+      candidates.push({ barrier: b, confidence: aiSignal.confidence, reason: aiSignal.reason, source: 'AI' });
+    }
+  }
+
+  if (patternSignal && patternSignal.barrier !== undefined) {
+    candidates.push({ barrier: patternSignal.barrier, confidence: patternSignal.confidence, reason: patternSignal.reason, source: 'Pattern' });
+  }
+
+  // If no candidates, pick the least frequent digit (highest gap) as default DIFF barrier
+  if (candidates.length === 0) {
+    if (data.distributionPct.length === 10) {
+      let minPct = Infinity, minDigit = 0;
+      for (let i = 0; i < 10; i++) {
+        if (data.distributionPct[i] < minPct) { minPct = data.distributionPct[i]; minDigit = i; }
+      }
+      return {
+        contractType: 'DIGITDIFF',
+        barrier: minDigit,
+        reason: `Default DIFF: d${minDigit} least frequent (${minPct.toFixed(1)}%)`,
+        confidence: 0.5,
+      };
+    }
+    return null;
+  }
+
+  // Deduplicate and pick the one with highest confidence
+  const seen = new Set<number>();
+  let best = candidates[0];
+  for (const c of candidates) {
+    if (!seen.has(c.barrier) || c.confidence > best.confidence) {
+      seen.add(c.barrier);
+      if (c.confidence > best.confidence) best = c;
+    }
+  }
+
+  // Check if multiple sources agree on the same barrier (consensus boost)
+  const barrierCounts = new Map<number, { count: number; totalConf: number; reason: string }>();
+  for (const c of candidates) {
+    const existing = barrierCounts.get(c.barrier);
+    if (existing) {
+      existing.count++;
+      existing.totalConf += c.confidence;
+    } else {
+      barrierCounts.set(c.barrier, { count: 1, totalConf: c.confidence, reason: c.reason });
+    }
+  }
+
+  // Find consensus barrier (2+ sources agree)
+  let consensusBarrier = best;
+  for (const [barrier, info] of barrierCounts) {
+    if (info.count >= 2 && info.totalConf > best.confidence) {
+      consensusBarrier = { barrier, confidence: Math.min(info.totalConf * 0.8, 1), reason: `[CONSENSUS ${info.count}x] ${info.reason}`, source: 'Multi' };
+    }
+  }
+
+  return {
+    contractType: 'DIGITDIFF',
+    barrier: consensusBarrier.barrier,
+    reason: consensusBarrier.reason,
+    confidence: consensusBarrier.confidence,
+  };
 }
 
 // Feed tick data to the AI engine
@@ -107,55 +153,76 @@ export function scoreAllMarkets(
     const logicScore = scoreMarketLogic(market);
     const aiScore = aiEngine.analyzeMarket(market);
 
-    const combinedScore = logicScore.score * cfg.logicWeight + aiScore.score * cfg.aiWeight;
+    // v4: Regime analysis
+    const regime = analyzeRegime(market);
 
-    // Get consensus signal
-    const { signal: consensusSignal, consensus } = getConsensusSignal(
-      logicScore.signal,
-      aiScore.signal
-    );
+    // v4: Pattern analysis
+    const { bestSignal: patternSignal, compositeScore: patternScore } = analyzePatterns(market);
 
+    // Scoring weights: Logic 50% + AI 30% + Patterns 20%
+    // Regime acts as a multiplier (0-1)
+    const rawScore = logicScore.score * cfg.logicWeight + aiScore.score * cfg.aiWeight + (patternScore * 100) * 0.2;
+    const regimeMultiplier = 0.3 + regime.tradability * 0.7; // min 30%, max 100%
+    const combinedScore = rawScore * regimeMultiplier;
+
+    // === Signal Selection ===
     let selectedSignal: TradeSignal | null = null;
     let ev = 0;
     let evAdjusted = false;
+    let backtestGrade: string | null = null;
 
-    if (consensusSignal) {
-      // v3: HARD BLOCK all 50/50 bets — convert to DIGITDIFF
-      if (BLOCKED_CONTRACTS.has(consensusSignal.contractType)) {
-        selectedSignal = convertToDiff(consensusSignal, '50/50 bet blocked');
-        ev = calculateEV(selectedSignal);
+    // Get the best DIGITDIFF barrier from all sources
+    const diffSignal = pickBestDiffBarrier(
+      logicScore.signal,
+      aiScore.signal,
+      patternSignal,
+      market
+    );
+
+    if (diffSignal) {
+      // v4: Backtest validation
+      const bt = quickBacktestDiff(market, diffSignal.barrier!);
+      backtestGrade = bt.passed ? 'PASS' : 'FAIL';
+
+      if (!bt.passed) {
+        // Backtest failed — this barrier doesn't work on this market
+        selectedSignal = null;
         evAdjusted = true;
-      }
-      // v3: DIGITMATCH needs 0.8+ confidence (need strong edge to overcome 10% base rate)
-      else if (consensusSignal.contractType === 'DIGITMATCH' && consensusSignal.confidence < 0.8) {
-        selectedSignal = convertToDiff(consensusSignal, `MATCH confidence ${Math.round(consensusSignal.confidence * 100)}% < 80%`);
-        ev = calculateEV(selectedSignal);
-        evAdjusted = true;
-      }
-      else {
-        ev = calculateEV(consensusSignal);
-        // v3: Only trade if EV is positive
-        if (ev > 0) {
-          selectedSignal = consensusSignal;
-        } else {
-          selectedSignal = null; // negative EV, skip
+      } else {
+        // Calculate real EV for DIGITDIFF with backtested win rate
+        const realWinProb = bt.winRate;
+        ev = (realWinProb * 0.85) - ((1 - realWinProb) * 1.0);
+
+        if (ev <= 0) {
+          selectedSignal = null;
           evAdjusted = true;
+        } else {
+          selectedSignal = {
+            ...diffSignal,
+            reason: `${diffSignal.reason} | BT:${bt.winRate.toFixed(0)}% EV:${ev.toFixed(3)}`,
+          };
         }
       }
     }
 
-    const consensusBonus = consensus ? 5 : 0;
+    // v4: If regime is 'random' and score is low, skip entirely
+    if (regime.regime === 'random' && regime.confidence < 0.2 && combinedScore < 25) {
+      selectedSignal = null;
+    }
 
     ranked.push({
       symbol: market.symbol,
       name: market.name,
       type: market.type,
-      combinedScore: combinedScore + consensusBonus,
+      combinedScore,
       logicScore,
       aiScore,
       selectedSignal,
       expectedValue: ev,
       evAdjusted,
+      regime,
+      patternScore,
+      backtestGrade,
       rank: 0,
     });
   }
