@@ -29,7 +29,7 @@ export interface ScoringConfig {
 const DEFAULT_CONFIG: ScoringConfig = {
   logicWeight: 0.6,
   aiWeight: 0.4,
-  minScore: 5,
+  minScore: 10,
   maxConcurrentTrades: 10,
 };
 
