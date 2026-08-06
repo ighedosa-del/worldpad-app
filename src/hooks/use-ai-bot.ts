@@ -59,7 +59,7 @@ export function useAIBot() {
   const runningRef = useRef(false);
   const cycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeTradesRef = useRef<Map<string, { signal: any; startedAt: number }>>(new Map());
-  const tradeLockRef = useRef(false);
+  const tradeLocksRef = useRef<Set<string>>(new Set()); // per-market locks
   const totalProfitRef = useRef(0);
   const tickDataRef = useRef<Map<string, MarketTickData | null>>(new Map());
   const lastRankingRef = useRef<RankedMarket[]>([]);
@@ -117,10 +117,11 @@ export function useAIBot() {
     return () => clearInterval(interval);
   }, [doUpdateRanking]);
 
-  // Execute a trade on a specific market
+  // Execute a trade on a specific market (per-market lock)
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
-    if (!market.selectedSignal || tradeLockRef.current) return;
-    tradeLockRef.current = true;
+    if (!market.selectedSignal) return;
+    if (tradeLocksRef.current.has(market.symbol)) return;
+    tradeLocksRef.current.add(market.symbol);
 
     try {
       const signal = market.selectedSignal;
@@ -172,7 +173,7 @@ export function useAIBot() {
       addAutoTraderLog(`[AI] Error on ${market.name}: ${(err as Error).message}`);
     } finally {
       activeTradesRef.current.delete(market.symbol);
-      tradeLockRef.current = false;
+      tradeLocksRef.current.delete(market.symbol);
     }
   }, [placeTrade, addAutoTraderLog, addTradeResult]);
 
@@ -205,7 +206,7 @@ export function useAIBot() {
     const simMode = isSimulating() || !isAuthorized;
     addAutoTraderLog(`[AI] === AI BOT STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 55 | Max concurrent: 2`);
+    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 10 | Max concurrent: 10`);
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
