@@ -45,7 +45,7 @@ const TABS = [
 ];
 
 export default function WorldpadPage() {
-  const { activeTab, setActiveTab, balance, isConnected, isConnecting, isAuthorized, accountMode, globalAIRunning, globalAIStatus, globalAITotalProfit, globalAIHealth } = useWorldpadStore();
+  const { activeTab, setActiveTab, balance, isConnected, isConnecting, isAuthorized, accountMode } = useWorldpadStore();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
 
@@ -178,14 +178,6 @@ export default function WorldpadPage() {
               <Key className="w-3.5 h-3.5" style={{ color: isAuthorized ? (accountMode === 'real' ? '#ef4444' : '#00d4aa') : '#7d8590' }} />
               <span className={`text-[10px] font-bold hidden sm:inline ${isAuthorized ? (accountMode === 'real' ? 'text-[#ef4444]' : 'text-[#00d4aa]') : 'text-gray-500'}`}>{isAuthorized ? (accountMode === 'real' ? 'REAL' : 'DEMO') : 'LOGIN'}</span>
             </button>
-
-            {/* Global AI status indicator */
-            {globalAIRunning && (
-              <div className="flex items-center gap-1 px-2 py-0.5 rounded-full" style={{ background: globalAIStatus === 'trading' ? 'rgba(34,197,94,0.1)' : 'rgba(168,85,247,0.1)', border: `1px solid ${globalAIStatus === 'trading' ? 'rgba(34,197,94,0.25)' : 'rgba(168,85,247,0.2)'}` }}>
-                <Brain className="w-3 h-3" style={{ color: globalAIStatus === 'trading' ? '#22c55e' : '#a855f7' }} />
-                <span className="text-[9px] font-bold" style={{ color: globalAIStatus === 'trading' ? '#22c55e' : '#a855f7' }}>AI</span>
-              </div>
-            )}
 
             {/* Connection status dot with glow */}
             <div className="flex items-center gap-1.5">
