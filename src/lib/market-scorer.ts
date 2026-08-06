@@ -4,10 +4,9 @@ import type { MarketData, MarketSymbol } from './multi-market-ws';
 import { scoreMarketLogic, LogicScore, TradeSignal } from './logic-engine';
 import { aiEngine, AIScore } from './ai-engine';
 
-// === Market Scorer v2 ===
-// Combines Logic (60%) + AI (40%) scores, ranks all markets,
-// and selects the top ones for trading.
-// v2: EV filtering, DIGITMATCH penalty, signal consensus, higher minScore
+// === Market Scorer v3 ===
+// HARD RULE: Only DIGITDIFF (90% win, +EV) and rarely DIGITMATCH (10% win, 8.5x payout).
+// DIGITOVER/UNDER/EVEN/ODD are BLOCKED — they're 50/50 with only 0.85x payout = -EV always.
 
 export interface RankedMarket {
   symbol: MarketSymbol;
@@ -17,8 +16,8 @@ export interface RankedMarket {
   logicScore: LogicScore;
   aiScore: AIScore;
   selectedSignal: TradeSignal | null;
-  expectedValue: number;      // v2: EV calculation
-  evAdjusted: boolean;        // v2: was the signal adjusted for EV?
+  expectedValue: number;
+  evAdjusted: boolean;
   rank: number;
 }
 
@@ -32,43 +31,44 @@ export interface ScoringConfig {
 const DEFAULT_CONFIG: ScoringConfig = {
   logicWeight: 0.6,
   aiWeight: 0.4,
-  minScore: 30,           // v2: raised from 10 to 30 — only real edges
+  minScore: 20,           // v3: lowered from 30 — DIFF signals are common
   maxConcurrentTrades: 10,
 };
 
-// === Payout tables (Deriv digit contracts) ===
-// These are approximate net profit multipliers on a $1 stake
-const PAYOUT_PROFIT_MULTIPLIER: Record<string, { profit: number; winProb: number }> = {
-  'DIGITMATCH':  { profit: 8.5,  winProb: 0.10 },  // 1-in-10, pays ~9.5x gross = 8.5x net profit
-  'DIGITDIFF':   { profit: 0.85, winProb: 0.90 },  // 9-in-10
-  'DIGITOVER':   { profit: 0.85, winProb: 0.50 },  // ~50/50
-  'DIGITUNDER':  { profit: 0.85, winProb: 0.50 },
-  'DIGITEVEN':   { profit: 0.85, winProb: 0.50 },
-  'DIGITODD':    { profit: 0.85, winProb: 0.50 },
-};
+// Contracts that are PROFITABLE to trade (real edge, not 50/50 house bets)
+const ALLOWED_CONTRACTS = new Set(['DIGITDIFF', 'DIGITMATCH']);
 
-// === v2: Calculate Expected Value for a signal ===
-// EV = (adjusted_win_prob × profit) - (loss_prob × 1)
-// If EV <= 0, the trade should NOT be taken
-calculateEV(signal: TradeSignal, logicScore: LogicScore, aiScore: AIScore): number {
-  const payout = PAYOUT_PROFIT_MULTIPLIER[signal.contractType];
-  if (!payout) return 0;
+// 50/50 bets with negative EV — ALWAYS blocked regardless of score or confidence
+const BLOCKED_CONTRACTS = new Set(['DIGITOVER', 'DIGITUNDER', 'DIGITEVEN', 'DIGITODD']);
 
-  // Base win probability from the contract type
-  let baseWinProb = payout.winProb;
-
-  // Boost win probability based on signal confidence
-  // confidence ranges 0-1, we use it to shift the base probability
-  const confidenceBoost = signal.confidence * 0.15; // max 15% boost at full confidence
-  const adjustedWinProb = Math.min(baseWinProb + confidenceBoost, 0.98);
-
-  // EV = (win% × profit_multiplier) - (lose% × 1.0)
-  // For a $1 stake, profit_multiplier is what you NET on a win
-  const ev = (adjustedWinProb * payout.profit) - ((1 - adjustedWinProb) * 1.0);
-  return ev;
+// === Real EV calculation (no fake confidence boost) ===
+calculateEV(signal: TradeSignal): number {
+  if (signal.contractType === 'DIGITDIFF') {
+    // 90% real win rate, 0.85x profit
+    return (0.90 * 0.85) - (0.10 * 1.0); // = +0.665
+  }
+  if (signal.contractType === 'DIGITMATCH') {
+    // 10% base, but confidence indicates how much the AI leans toward this digit
+    // Need >11.8% win rate to break even (payout 8.5x net, cost 1x)
+    // Breakeven: p * 8.5 = (1-p) * 1 → p = 1/9.5 = 10.53%
+    // We use confidence as an edge indicator: real_prob ≈ 10% + confidence * 10%
+    const adjustedProb = 0.10 + signal.confidence * 0.10; // max 20% at full confidence
+    return (adjustedProb * 8.5) - ((1 - adjustedProb) * 1.0);
+  }
+  return -1; // blocked contracts
 }
 
-// === v2: Signal consensus — do Logic and AI agree on the contract type? ===
+// === Convert any blocked signal to DIGITDIFF ===
+function convertToDiff(signal: TradeSignal, reason: string): TradeSignal {
+  return {
+    contractType: 'DIGITDIFF',
+    barrier: signal.barrier,
+    reason: `[CONVERTED→DIFF] ${reason}: ${signal.contractType} d${signal.barrier ?? '-'} is a 50/50 bet (-EV)`,
+    confidence: 0.7, // DIFF has inherent 90% edge
+  };
+}
+
+// === Signal consensus ===
 function getConsensusSignal(logicSignal: TradeSignal | null, aiSignal: TradeSignal | null): { signal: TradeSignal | null; consensus: boolean } {
   if (!logicSignal && !aiSignal) return { signal: null, consensus: false };
   if (!logicSignal) return { signal: aiSignal, consensus: false };
@@ -76,7 +76,6 @@ function getConsensusSignal(logicSignal: TradeSignal | null, aiSignal: TradeSign
 
   // Both exist — check if they agree on contract type
   if (logicSignal.contractType === aiSignal.contractType) {
-    // CONSENSUS! Boost confidence
     const boosted = {
       ...logicSignal,
       confidence: Math.min(logicSignal.confidence + 0.15, 1.0),
@@ -85,30 +84,13 @@ function getConsensusSignal(logicSignal: TradeSignal | null, aiSignal: TradeSign
     return { signal: boosted, consensus: true };
   }
 
-  // No consensus — only use the higher-confidence signal if it's strong enough
-  // But NEVER use DIGITMATCH without consensus or very high confidence
+  // No consensus — use higher confidence signal
   const best = logicSignal.confidence >= aiSignal.confidence ? logicSignal : aiSignal;
-
-  // DIGITMATCH without consensus needs 0.8+ confidence, otherwise convert to DIGITDIFF
-  if (best.contractType === 'DIGITMATCH' && best.confidence < 0.8) {
-    return {
-      signal: {
-        contractType: 'DIGITDIFF',
-        barrier: best.barrier,
-        reason: `[CONVERTED MATCH→DIFF] Low confidence (${Math.round(best.confidence * 100)}%): ${best.reason}`,
-        confidence: Math.min(best.confidence + 0.1, 0.7),
-      },
-      consensus: false,
-    };
-  }
-
-  // For non-MATCH signals without consensus, require at least 0.5 confidence
-  if (best.confidence < 0.5) return { signal: null, consensus: false };
-
+  if (best.confidence < 0.3) return { signal: null, consensus: false };
   return { signal: best, consensus: false };
 }
 
-// Feed tick data to the AI engine (called on every tick)
+// Feed tick data to the AI engine
 export function feedTickToAI(symbol: string, data: MarketData) {
   aiEngine.processTick(symbol, data);
 }
@@ -127,43 +109,41 @@ export function scoreAllMarkets(
 
     const combinedScore = logicScore.score * cfg.logicWeight + aiScore.score * cfg.aiWeight;
 
-    // v2: Use consensus system instead of raw confidence pick
+    // Get consensus signal
     const { signal: consensusSignal, consensus } = getConsensusSignal(
       logicScore.signal,
       aiScore.signal
     );
 
-    // v2: Calculate EV for the selected signal
     let selectedSignal: TradeSignal | null = null;
     let ev = 0;
     let evAdjusted = false;
 
     if (consensusSignal) {
-      ev = calculateEV(consensusSignal, logicScore, aiScore);
-
-      // v2: DIGITMATCH hard gate — even with consensus, need 0.75+ confidence
-      if (consensusSignal.contractType === 'DIGITMATCH' && consensusSignal.confidence < 0.75) {
-        // Convert to DIGITDIFF
-        selectedSignal = {
-          contractType: 'DIGITDIFF',
-          barrier: consensusSignal.barrier,
-          reason: `[EV FILTER] MATCH→DIFF: confidence ${Math.round(consensusSignal.confidence * 100)}% < 75% | EV was ${ev.toFixed(3)}`,
-          confidence: consensusSignal.confidence,
-        };
-        ev = calculateEV(selectedSignal, logicScore, aiScore);
+      // v3: HARD BLOCK all 50/50 bets — convert to DIGITDIFF
+      if (BLOCKED_CONTRACTS.has(consensusSignal.contractType)) {
+        selectedSignal = convertToDiff(consensusSignal, '50/50 bet blocked');
+        ev = calculateEV(selectedSignal);
         evAdjusted = true;
       }
-      // v2: Reject negative EV trades (unless it's DIGITDIFF which is almost always positive)
-      else if (ev <= 0 && consensusSignal.contractType !== 'DIGITDIFF') {
-        // Signal exists but EV is negative — skip this market
-        selectedSignal = null;
+      // v3: DIGITMATCH needs 0.8+ confidence (need strong edge to overcome 10% base rate)
+      else if (consensusSignal.contractType === 'DIGITMATCH' && consensusSignal.confidence < 0.8) {
+        selectedSignal = convertToDiff(consensusSignal, `MATCH confidence ${Math.round(consensusSignal.confidence * 100)}% < 80%`);
+        ev = calculateEV(selectedSignal);
         evAdjusted = true;
-      } else {
-        selectedSignal = consensusSignal;
+      }
+      else {
+        ev = calculateEV(consensusSignal);
+        // v3: Only trade if EV is positive
+        if (ev > 0) {
+          selectedSignal = consensusSignal;
+        } else {
+          selectedSignal = null; // negative EV, skip
+          evAdjusted = true;
+        }
       }
     }
 
-    // v2: Bonus score for consensus
     const consensusBonus = consensus ? 5 : 0;
 
     ranked.push({
@@ -180,10 +160,7 @@ export function scoreAllMarkets(
     });
   }
 
-  // Sort by combined score descending
   ranked.sort((a, b) => b.combinedScore - a.combinedScore);
-
-  // Assign ranks
   ranked.forEach((m, i) => m.rank = i + 1);
 
   return ranked;
@@ -194,21 +171,16 @@ export function selectTrades(
   ranked: RankedMarket[],
   config: Partial<ScoringConfig> = {},
   activeTradeSymbols: Set<string> = new Set(),
-  cooldownSymbols: Set<string> = new Set()  // v2: per-market loss cooldown
+  cooldownSymbols: Set<string> = new Set()
 ): RankedMarket[] {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
   return ranked
     .filter(m => {
-      // Must meet minimum score (v2: 30)
       if (m.combinedScore < cfg.minScore) return false;
-      // Must have a signal
       if (!m.selectedSignal) return false;
-      // Must not already have an active trade on this market
       if (activeTradeSymbols.has(m.symbol)) return false;
-      // v2: Must not be in loss cooldown
       if (cooldownSymbols.has(m.symbol)) return false;
-      // v2: Must have positive expected value (safety net)
       if (m.expectedValue <= 0) return false;
       return true;
     })
