@@ -17,11 +17,12 @@ import { Speedbot } from '@/components/worldpad/speedbot';
 import { BulkTrader } from '@/components/worldpad/bulk-trader';
 import { AISoftware } from '@/components/worldpad/ai-software';
 import { AIScanner } from '@/components/worldpad/ai-scanner';
+import { TradingDraft } from '@/components/worldpad/trading-draft';
 import { AuthModal } from '@/components/worldpad/auth-modal';
 import {
   Bot, Zap, Settings, Gauge, Brain,
   ScanSearch, Hand, Layers, LineChart,
-  Users, Shield, Menu, X, DollarSign, Key,
+  Users, Shield, Menu, X, DollarSign, Key, PenTool,
 } from 'lucide-react';
 import { useState } from 'react';
 
@@ -32,6 +33,7 @@ const TABS = [
   { id: 'speedbot', label: 'Speedbot', icon: Gauge },
   { id: 'ai-software', label: 'AI Software', icon: Brain },
   { id: 'ai-scanner', label: 'AI Scanner', icon: Brain },
+  { id: 'trading-draft', label: 'Trading Draft', icon: PenTool },
   { id: 'auto-trader', label: 'Auto Trader', icon: ScanSearch },
   { id: 'analysis-tool', label: 'Analysis Tool', icon: Hand },
   { id: 'manual-trader', label: 'Manual Trader', icon: Layers },
@@ -69,6 +71,7 @@ export default function WorldpadPage() {
       case 'bulk-trader': return <BulkTrader />;
       case 'ai-software': return <AISoftware />;
       case 'ai-scanner': return <AIScanner />;
+      case 'trading-draft': return <TradingDraft />;
       case 'copy-trader': return <CopyTrader />;
       default:
         const tab = TABS.find(t => t.id === activeTab);
