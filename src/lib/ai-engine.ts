@@ -343,3 +343,4 @@ class AIEngine {
 
 // Singleton instance
 export const aiEngine = new AIEngine();
+console.log('[AI Engine] v3-loaded-bayesian-fix-payout-fix');
