@@ -11,7 +11,7 @@ import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
 import { calculateStake, recordRiskResult, resetRiskStates, getSessionPL } from '@/lib/risk-manager';
 import { checkLiveTrade, recordLiveTrade, resetLiveSession, getLiveStats, preFlightCheck } from '@/lib/real-money-guard';
-import { getProposalWS, buyContractWS, restoreCredentials } from '@/lib/deriv-ws';
+import { getProposalWS, buyContractWS, restoreCredentials, getTradeWSStatus } from '@/lib/deriv-ws';
 import type { TradeResult } from '@/hooks/use-trade-execution';
 import { clearPendingSimTrades } from '@/hooks/use-trade-execution';
 
@@ -82,9 +82,11 @@ async function placeTradeDirect(params: {
   // which is irrelevant — GlobalAI uses multi-market-ws for ticks (always real data).
   const authorized = useWorldpadStore.getState().isAuthorized;
   const simMode = !authorized;
-  console.log('[GlobalAI] placeTradeDirect: isAuthorized=', authorized, 'simMode=', simMode);
+  const wsStatus = getTradeWSStatus();
+  console.log('[GlobalAI] placeTradeDirect: isAuthorized=', authorized, 'simMode=', simMode, 'ws=', wsStatus);
 
   if (simMode) {
+    console.warn('[GlobalAI] SIMULATION TRADE — NOT sending to Deriv. isAuthorized=', authorized);
     if (pendingSimTradesGlobal.has(params.symbol)) return null;
 
     return new Promise<TradeResult | null>((resolve) => {
@@ -101,8 +103,9 @@ async function placeTradeDirect(params: {
     });
   }
 
-  // LIVE mode
+  // LIVE mode — sending real trade to Deriv
   try {
+    console.log('[GlobalAI] LIVE TRADE — sending to Deriv WS (ready:', wsStatus.wsReady, 'token:', wsStatus.tokenPreview, ')');
     const proposal = await getProposalWS({
       contractType: params.contractType,
       symbol: params.symbol,
@@ -481,12 +484,18 @@ export function GlobalAI() {
 
     // v5: Restore Deriv credentials from persisted store so trades work after reload
     const store = useWorldpadStore.getState();
+    console.log('[GlobalAI] INIT — isAuthorized:', store.isAuthorized, 'mode:', store.accountMode, 'hasDemoToken:', !!store.demoToken, 'hasRealToken:', !!store.realToken, 'accountId:', store.selectedAccountId);
     if (store.isAuthorized && store.selectedAccountId) {
       const token = store.accountMode === 'demo' ? store.demoToken : store.realToken;
       if (token && store.derivAppId) {
         restoreCredentials(token, store.derivAppId, store.selectedAccountId);
-        console.log('[GlobalAI] Restored Deriv credentials for', store.accountMode, 'trading');
+        const wsCheck = getTradeWSStatus();
+        console.log('[GlobalAI] Restored Deriv credentials for', store.accountMode, 'trading. WS status:', wsCheck);
+      } else {
+        console.warn('[GlobalAI] isAuthorized=true but MISSING token or appId! token=', !!token, 'appId=', !!store.derivAppId);
       }
+    } else {
+      console.warn('[GlobalAI] NOT authorized. isAuthorized=', store.isAuthorized, 'accountId=', store.selectedAccountId);
     }
 
     const autoStartTimer = setTimeout(() => {

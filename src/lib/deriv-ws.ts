@@ -18,6 +18,17 @@ let storedPatToken: string = '';
 let storedAppId: string = '';
 let storedAccountId: string = '';
 
+// v5: Export connection status for debugging
+export function getTradeWSStatus(): { wsReady: boolean; hasToken: boolean; hasAppId: boolean; hasAccountId: boolean; tokenPreview: string } {
+  return {
+    wsReady: ws?.readyState === WebSocket.OPEN,
+    hasToken: !!storedPatToken,
+    hasAppId: !!storedAppId,
+    hasAccountId: !!storedAccountId,
+    tokenPreview: storedPatToken ? `${storedPatToken.slice(0, 8)}...` : '(none)',
+  };
+}
+
 // Promise-based request/response over WebSocket
 let reqIdCounter = 1;
 const pendingRequests = new Map<number, { resolve: (data: any) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
