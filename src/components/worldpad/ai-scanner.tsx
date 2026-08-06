@@ -202,7 +202,17 @@ function HealthBanner({ health, isRunning }: { health: ScannerHealth; isRunning:
 
 function LearningPanel({ learningStats }: { learningStats: { strategiesLearned: number; totalTradesRecorded: number; totalWins: number; totalLosses: number; winRate: number; totalProfit: number } }) {
   const [open, setOpen] = useState(false);
+  const [cleared, setCleared] = useState(false);
   const { strategiesLearned, totalTradesRecorded, totalWins, totalLosses, winRate, totalProfit } = learningStats;
+
+  const handleClearBrain = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('wp-ai-learning');
+      setCleared(true);
+      setTimeout(() => setCleared(false), 3000);
+    }
+  };
+
   return (
     <div className="rounded-xl overflow-hidden" style={{ background: '#161b22', border: '1px solid #30363d' }}>
       <button onClick={() => setOpen(!open)} className="w-full flex items-center justify-between px-4 py-3 transition-colors hover:bg-[rgba(255,255,255,0.02)]">
@@ -231,6 +241,17 @@ function LearningPanel({ learningStats }: { learningStats: { strategiesLearned: 
             <span className="text-green-400">W{totalWins}</span><span className="text-gray-600">/</span><span className="text-red-400">L{totalLosses}</span>
             <span className="text-gray-600 mx-1">.</span><span>AI learns from every trade</span>
           </div>
+          <button
+            onClick={handleClearBrain}
+            className="mt-3 w-full py-2 rounded-lg text-xs font-bold transition-all duration-200"
+            style={{
+              background: cleared ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.1)',
+              color: cleared ? '#22c55e' : '#f87171',
+              border: `1px solid ${cleared ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.25)'}`,
+            }}
+          >
+            {cleared ? 'Brain Cleared! Refresh page to restart' : 'Clear AI Brain (Reset Learning)'}
+          </button>
         </div>
       )}
     </div>
