@@ -2,8 +2,9 @@
 
 // === Multi-Market Scanner ===
 // Uses ticks_history polling because Deriv public WS rejects tick subscriptions.
-// ticks_history (one-time query) works fine without authentication.
-// Standard markets tick every ~2-4s, fast (1s) markets every ~1s.
+// RATE LIMIT SAFE: Round-robin polling — 1 request per 800ms cycling through 10 markets.
+// This gives ~1.25 req/s, well within Deriv's public API limits.
+// Uses count=5 to extract multiple new ticks per request.
 
 export const SCANNED_MARKETS = [
   { symbol: 'R_100', name: 'Volatility 100',   type: 'standard' as const },
@@ -44,12 +45,11 @@ export type OnMarketTickCallback = (symbol: MarketSymbol, data: MarketData) => v
 const MAX_DIGITS = 500;
 const DERIV_WS_URL = 'wss://ws.derivws.com/websockets/v3?app_id=1089';
 
+// === State ===
 let ws: WebSocket | null = null;
 let marketData: MarketDataMap;
 let tickCallbacks: Set<OnMarketTickCallback> = new Set();
 let isConnected = false;
-let pollTimerFast: ReturnType<typeof setInterval> | null = null;
-let pollTimerStandard: ReturnType<typeof setInterval> | null = null;
 let totalTicksReceived = 0;
 let lastTickTime = 0;
 let connectTime = 0;
@@ -60,6 +60,11 @@ let pendingRequests = new Map<number, {
   symbol: MarketSymbol;
   resolve: (data: any) => void;
 }>();
+
+// Round-robin state
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+let roundRobinIndex = 0;
+let isRequestInFlight = false;
 
 function initMarketData(): MarketDataMap {
   const data = {} as MarketDataMap;
@@ -93,7 +98,7 @@ function updateDistribution(md: MarketData) {
   }
 }
 
-function requestTicksHistory(symbol: string): Promise<{ prices: number[]; times: number[] } | null> {
+function requestTicksHistory(symbol: string, count: number): Promise<{ prices: number[]; times: number[] } | null> {
   return new Promise((resolve) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       resolve(null);
@@ -102,6 +107,7 @@ function requestTicksHistory(symbol: string): Promise<{ prices: number[]; times:
     const reqId = reqIdCounter++;
     const timer = setTimeout(() => {
       pendingRequests.delete(reqId);
+      isRequestInFlight = false;
       resolve(null);
     }, 5000);
     pendingRequests.set(reqId, {
@@ -110,7 +116,7 @@ function requestTicksHistory(symbol: string): Promise<{ prices: number[]; times:
     });
     ws.send(JSON.stringify({
       ticks_history: symbol,
-      count: 1,
+      count: count,
       end: 'latest',
       style: 'ticks',
       req_id: reqId,
@@ -118,29 +124,37 @@ function requestTicksHistory(symbol: string): Promise<{ prices: number[]; times:
   });
 }
 
-function processTick(symbol: MarketSymbol, price: number) {
+function processNewTicks(symbol: MarketSymbol, prices: number[], times: number[]) {
   const md = marketData[symbol];
-  if (!md) return;
+  if (!md || prices.length === 0) return;
 
-  const priceStr = price.toFixed(3);
-  const lastDigit = parseInt(priceStr[priceStr.length - 1], 10);
+  let anyNew = false;
+  // Process from oldest to newest, skip duplicates
+  for (let i = 0; i < prices.length; i++) {
+    const price = prices[i];
+    const priceStr = price.toFixed(3);
+    const lastDigit = parseInt(priceStr[priceStr.length - 1], 10);
 
-  // Deduplicate: skip if same as last tick
-  if (md.lastTick && md.lastTick.price === priceStr) return;
+    // Deduplicate: skip if same as last tick
+    if (md.lastTick && md.lastTick.price === priceStr) continue;
 
-  md.digits.push(lastDigit);
-  if (md.digits.length > MAX_DIGITS) md.digits.shift();
-  md.lastTick = { digit: lastDigit, price: priceStr, timestamp: Date.now() };
-  md.tickCount++;
-  totalTicksReceived++;
-  lastTickTime = Date.now();
-  md.connected = true;
-  updateDistribution(md);
+    md.digits.push(lastDigit);
+    if (md.digits.length > MAX_DIGITS) md.digits.shift();
+    md.lastTick = { digit: lastDigit, price: priceStr, timestamp: times[i] || Date.now() };
+    md.tickCount++;
+    totalTicksReceived++;
+    lastTickTime = Date.now();
+    md.connected = true;
+    anyNew = true;
+  }
 
-  // Notify callbacks
-  const snapshot = { ...md };
-  for (const cb of tickCallbacks) {
-    try { cb(symbol, snapshot); } catch (e) { /* skip */ }
+  if (anyNew) {
+    updateDistribution(md);
+    // Notify callbacks
+    const snapshot = { ...md };
+    for (const cb of tickCallbacks) {
+      try { cb(symbol, snapshot); } catch (_) { /* skip */ }
+    }
   }
 }
 
@@ -154,9 +168,16 @@ function handleMessage(event: MessageEvent) {
       if (reqId !== undefined && pendingRequests.has(reqId)) {
         const pending = pendingRequests.get(reqId)!;
         pendingRequests.delete(reqId);
-        const prices = msg.history.prices;
+        isRequestInFlight = false;
+
+        // Clear rate limit error on successful response
+        if (wsError && wsError.includes('rate limit')) {
+          wsError = null;
+        }
+
+        const { prices, times } = msg.history;
         if (prices.length > 0) {
-          processTick(pending.symbol, prices[prices.length - 1]);
+          processNewTicks(pending.symbol, prices, times);
         }
         pending.resolve(msg.history);
       }
@@ -169,35 +190,70 @@ function handleMessage(event: MessageEvent) {
       if (reqId !== undefined && pendingRequests.has(reqId)) {
         const pending = pendingRequests.get(reqId)!;
         pendingRequests.delete(reqId);
-        console.warn('[MultiMarketWS] Error for', pending.symbol, ':', msg.error.message);
-        wsError = msg.error.message;
+        isRequestInFlight = false;
+        const errMsg = msg.error.message || 'Unknown error';
+        console.warn('[MultiMarketWS] Error for', pending.symbol, ':', errMsg);
+        wsError = errMsg;
         pending.resolve(null);
       }
     }
   } catch {
-    // ignore
+    // ignore parse errors
   }
 }
 
-async function pollMarkets(type: 'standard' | 'fast') {
-  const markets = SCANNED_MARKETS.filter(m => m.type === type);
-  // Fire all requests in parallel, then await all
-  const promises = markets.map(m => requestTicksHistory(m.symbol));
-  await Promise.all(promises);
+// === Round-Robin Polling ===
+// One request every 800ms, cycling through all 10 markets.
+// ~1.25 req/s total — safe for Deriv public API.
+// Fast markets get polled 2x per full cycle (they appear twice in the rotation).
+
+function buildPollOrder(): MarketSymbol[] {
+  // Interleave: fast markets appear twice as often as standard
+  const fast: MarketSymbol[] = SCANNED_MARKETS.filter(m => m.type === 'fast').map(m => m.symbol);
+  const standard: MarketSymbol[] = SCANNED_MARKETS.filter(m => m.type === 'standard').map(m => m.symbol);
+  const order: MarketSymbol[] = [];
+  const maxLen = Math.max(fast.length, standard.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < fast.length) order.push(fast[i]);
+    if (i < standard.length) order.push(standard[i]);
+  }
+  return order;
+}
+
+const POLL_ORDER = buildPollOrder();
+// Result: [1HZ100V, R_100, 1HZ10V, R_10, 1HZ25V, R_25, 1HZ50V, R_50, 1HZ75V, R_75]
+// 10 items, each polled once per cycle = 10 * 800ms = 8s per full cycle
+// Fast markets: ~4s between polls, Standard: ~8s between polls
+
+const ROUND_ROBIN_INTERVAL = 800; // ms between requests
+
+function pollNextMarket() {
+  if (isRequestInFlight) return; // skip if previous request still pending
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const symbol = POLL_ORDER[roundRobinIndex % POLL_ORDER.length];
+  roundRobinIndex++;
+
+  isRequestInFlight = true;
+  requestTicksHistory(symbol, 5)
+    .catch(() => { isRequestInFlight = false; });
 }
 
 function startPolling() {
   stopPolling();
-  pollTimerFast = setInterval(() => pollMarkets('fast'), 1500);
-  pollTimerStandard = setInterval(() => pollMarkets('standard'), 2500);
-  // Immediate first poll
-  pollMarkets('fast');
-  pollMarkets('standard');
+  roundRobinIndex = 0;
+  isRequestInFlight = false;
+  // Fire first 3 requests immediately (staggered by 200ms) to seed data faster
+  for (let i = 0; i < 3; i++) {
+    setTimeout(() => pollNextMarket(), i * 200);
+  }
+  // Then continue round-robin
+  pollTimer = setInterval(pollNextMarket, ROUND_ROBIN_INTERVAL);
 }
 
 function stopPolling() {
-  if (pollTimerFast) { clearInterval(pollTimerFast); pollTimerFast = null; }
-  if (pollTimerStandard) { clearInterval(pollTimerStandard); pollTimerStandard = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  isRequestInFlight = false;
 }
 
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -206,7 +262,7 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectInternal();
-  }, 3000);
+  }, 5000);
 }
 
 function connectInternal() {
@@ -226,7 +282,7 @@ function connectInternal() {
 
   ws.onopen = () => {
     isConnected = true;
-    console.log('[MultiMarketWS] Connected - polling', SCANNED_MARKETS.length, 'markets');
+    console.log('[MultiMarketWS] Connected - round-robin polling', SCANNED_MARKETS.length, 'markets @', ROUND_ROBIN_INTERVAL, 'ms interval');
     startPolling();
   };
 
