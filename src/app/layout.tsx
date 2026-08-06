@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Worldpad — Trading Research Lab",
+  title: "WorldPad Pro — Trading Research Lab",
   description: "Advanced Deriv digit trading AI platform with bot builder, analysis tools, and live market data.",
   icons: {
     icon: "/logo.svg",
