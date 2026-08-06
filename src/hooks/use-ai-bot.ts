@@ -105,26 +105,15 @@ export function useAIBot() {
   }, [updateRankingThrottled]);
 
   // === FALLBACK: Poll every 1 second to force re-score ===
-  // This ensures the UI updates even if the tick callback chain breaks.
-  // It also updates connection health and forces a re-render.
   useEffect(() => {
     const interval = setInterval(() => {
       if (!mountedRef.current) return;
-
-      // Update connection status
       const connected = isScannerConnected();
       setScannerConnected(connected);
-
-      // Update health data (triggers re-render with fresh market data)
       const health = getScannerHealth();
       setScannerHealth(health);
-
-      // Force re-score on every poll tick
-      // This is the KEY FIX: even if no tick callbacks fire,
-      // we still score the markets every second.
       doUpdateRanking();
     }, 1000);
-
     return () => clearInterval(interval);
   }, [doUpdateRanking]);
 
@@ -135,9 +124,9 @@ export function useAIBot() {
 
     try {
       const signal = market.selectedSignal;
-      addAutoTraderLog(`[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}`);
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}`;
+      addAutoTraderLog(logMsg);
 
-      // Mark as active trade
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
 
       const result = await placeTrade({
@@ -150,14 +139,31 @@ export function useAIBot() {
       });
 
       if (result) {
-        // Record result to AI for learning
+        const won = result.profit > 0;
+        const logResult = won
+          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)}`
+          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)}`;
+        addAutoTraderLog(logResult);
+
+        // Record to AI engine for learning
         aiEngine.recordTradeResult(
-          market.symbol,
-          signal.contractType,
-          signal.barrier,
-          result.profit,
-          market.combinedScore
+          market.symbol, signal.contractType, signal.barrier,
+          result.profit, market.combinedScore
         );
+
+        // Record to global trade history (Trading Draft)
+        addTradeResult({
+          id: `ai-${Date.now()}-${market.symbol}`,
+          type: signal.contractType,
+          symbol: market.symbol,
+          stake,
+          payout: result.payout || stake * 0.85,
+          profit: result.profit,
+          digit: signal.barrier ?? -1,
+          won,
+          timestamp: Date.now(),
+        });
+
         totalProfitRef.current += result.profit;
         setTotalTradesPlaced(prev => prev + 1);
         setLearningStats(aiEngine.getLearningStats());
@@ -168,58 +174,38 @@ export function useAIBot() {
       activeTradesRef.current.delete(market.symbol);
       tradeLockRef.current = false;
     }
-  }, [placeTrade, addAutoTraderLog]);
+  }, [placeTrade, addAutoTraderLog, addTradeResult]);
 
   // Main AI bot cycle
   const runCycle = useCallback(async () => {
     if (!runningRef.current) return;
-
     setStatus('scanning');
     const ranked = lastRankingRef.current;
-
-    if (ranked.length === 0) {
-      setStatus('waiting');
-      return;
-    }
-
-    // Select top trades
+    if (ranked.length === 0) { setStatus('waiting'); return; }
     const trades = selectTrades(ranked, {}, new Set(activeTradesRef.current.keys()));
-
-    if (trades.length === 0) {
-      setStatus('waiting');
-      return;
-    }
-
+    if (trades.length === 0) { setStatus('waiting'); return; }
     setStatus('trading');
     setCycleCount(prev => prev + 1);
-
-    // Execute trades on selected markets
     for (const trade of trades) {
       await executeTradeOnMarket(trade, botConfig.stake);
     }
-
     setStatus('waiting');
   }, [executeTradeOnMarket, botConfig.stake]);
 
   // Start the AI bot
   const startBot = useCallback(() => {
-    // Load learning data
     aiEngine.loadLearningData();
     setLearningStats(aiEngine.getLearningStats());
-
     runningRef.current = true;
     setIsRunning(true);
     totalProfitRef.current = 0;
     setCycleCount(0);
     setTotalTradesPlaced(0);
     activeTradesRef.current.clear();
-
     const simMode = isSimulating() || !isAuthorized;
     addAutoTraderLog(`[AI] === AI BOT STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
     addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 55 | Max concurrent: 2`);
-
-    // Start the trading cycle timer (every 2.5 seconds)
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
@@ -230,24 +216,17 @@ export function useAIBot() {
     runLoop();
   }, [isAuthorized, botConfig, addAutoTraderLog, runCycle]);
 
-  // Stop the AI bot — stop trading but KEEP scanning
+  // Stop the AI bot
   const stopBot = useCallback(() => {
     runningRef.current = false;
     setIsRunning(false);
     setStatus('idle');
-
     if (cycleTimerRef.current) { clearTimeout(cycleTimerRef.current); cycleTimerRef.current = null; }
-
-    // Stop and restart scanning (clears stale data, reconnects fresh)
     stopMultiMarketScan();
     setTimeout(() => {
-      if (mountedRef.current) {
-        startMultiMarketScan();
-      }
+      if (mountedRef.current) startMultiMarketScan();
     }, 500);
-
     activeTradesRef.current.clear();
-
     addAutoTraderLog(`[AI] === AI BOT STOPPED === | Cycles: ${cycleCount} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     aiEngine.saveLearningData();
   }, [addAutoTraderLog, cycleCount]);
@@ -257,7 +236,6 @@ export function useAIBot() {
     mountedRef.current = true;
     startMultiMarketScan();
     aiEngine.loadLearningData();
-
     return () => {
       mountedRef.current = false;
       runningRef.current = false;
@@ -268,16 +246,9 @@ export function useAIBot() {
   }, []);
 
   return {
-    isRunning,
-    rankedMarkets,
-    scannerConnected,
-    scannerHealth,
-    status,
-    cycleCount,
-    totalTradesPlaced,
+    isRunning, rankedMarkets, scannerConnected, scannerHealth,
+    status, cycleCount, totalTradesPlaced,
     totalProfit: totalProfitRef.current,
-    learningStats,
-    startBot,
-    stopBot,
+    learningStats, startBot, stopBot,
   };
 }
