@@ -267,7 +267,7 @@ class AIEngine {
 
     // --- Bayesian Score (0-25) ---
     const bayesPred = this.getBayesianPrediction(symbol, lastDigit);
-    const bayesScore = Math.round(bayesPred.confidence * 25);
+    const bayesianScore = Math.round(bayesPred.confidence * 25);
 
     // --- Learning Score (0-20) ---
     // Based on historical performance of strategies on this market
@@ -311,7 +311,7 @@ class AIEngine {
       }
     }
 
-    const totalScore = markovScore + entropyScore + bayesScore + learningScore;
+    const totalScore = markovScore + entropyScore + bayesianScore + learningScore;
 
     return {
       score: totalScore,
