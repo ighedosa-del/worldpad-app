@@ -2,9 +2,9 @@
 
 import { useMemo, useState } from 'react';
 import { Play, Square, Brain, Wifi, WifiOff, ChevronDown, ChevronUp, Trophy, TrendingUp, BarChart3, GraduationCap, Activity, AlertTriangle, Radio, ScrollText, CheckCircle2, XCircle, Clock } from 'lucide-react';
-import { useAIBot, type ScannerHealth } from '@/hooks/use-ai-bot';
 import { SCANNED_MARKETS, getMarketData } from '@/lib/multi-market-ws';
 import { useWorldpadStore } from '@/lib/store';
+import type { RankedMarket, ScannerHealth } from '@/hooks/use-ai-bot';
 
 type StatusBadgeColor = 'scanning' | 'trading' | 'waiting' | 'idle';
 
@@ -60,7 +60,7 @@ function MiniStat({ label, value }: { label: string; value: number }) {
 }
 
 function MarketCard({ market, lastDigit, tickCount, maxTicks }: {
-  market: ReturnType<typeof useAIBot>['rankedMarkets'][number];
+  market: RankedMarket;
   lastDigit: number | null;
   tickCount: number;
   maxTicks: number;
@@ -200,7 +200,7 @@ function HealthBanner({ health, isRunning }: { health: ScannerHealth; isRunning:
   );
 }
 
-function LearningPanel({ learningStats }: { learningStats: ReturnType<typeof useAIBot>['learningStats'] }) {
+function LearningPanel({ learningStats }: { learningStats: { strategiesLearned: number; totalTradesRecorded: number; totalWins: number; totalLosses: number; winRate: number; totalProfit: number } }) {
   const [open, setOpen] = useState(false);
   const { strategiesLearned, totalTradesRecorded, totalWins, totalLosses, winRate, totalProfit } = learningStats;
   return (
@@ -301,11 +301,25 @@ function TradingDraftPanel() {
 }
 
 export function AIScanner() {
+  // Read everything from the global AI store (runs on ALL tabs)
   const {
-    isRunning, rankedMarkets, scannerConnected, scannerHealth,
-    status, cycleCount, totalTradesPlaced, totalProfit,
-    learningStats, startBot, stopBot,
-  } = useAIBot();
+    globalAIRunning: isRunning,
+    globalAIRankedMarkets: rankedMarkets,
+    globalAIStatus: status,
+    globalAICycleCount: cycleCount,
+    globalAITotalTrades: totalTradesPlaced,
+    globalAITotalProfit: totalProfit,
+    globalAIHealth: scannerHealth,
+    globalAILearningStats: learningStats,
+    tradeHistory, totalWins, totalLosses,
+  } = useWorldpadStore();
+
+  const scannerConnected = scannerHealth.isConnected;
+
+  const handleToggle = () => {
+    const gai = (window as any).__globalAI;
+    if (isRunning) gai?.stopBot(); else gai?.startBot();
+  };
 
   const marketLive = useMemo(() => {
     const map: Record<string, { lastDigit: number | null; tickCount: number }> = {};
@@ -357,7 +371,7 @@ export function AIScanner() {
           ) : (
             <div className="flex items-center gap-1.5"><WifiOff className="w-3.5 h-3.5 text-red-400" /><span className="text-[10px] text-red-400 font-medium">Disconnected</span></div>
           )}
-          <button onClick={() => { if (isRunning) stopBot(); else startBot(); }} className={`flex items-center gap-1.5 px-5 py-2 rounded-lg text-xs font-bold transition-all duration-200 ${isRunning ? 'wp-btn-danger' : 'wp-btn-primary'}`}>
+          <button onClick={handleToggle} className={`flex items-center gap-1.5 px-5 py-2 rounded-lg text-xs font-bold transition-all duration-200 ${isRunning ? 'wp-btn-danger' : 'wp-btn-primary'}`}>
             {isRunning ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
             {isRunning ? 'STOP' : 'START'}
           </button>

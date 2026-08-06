@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { DerivAccount } from './deriv-ws';
+import type { RankedMarket } from './market-scorer';
+import type { ScannerHealth } from '@/hooks/use-ai-bot';
 
 export interface BotConfig {
   market: string;
@@ -76,6 +78,15 @@ export interface WorldpadState {
   botConsecutiveLosses: number;
   activeBotId: string | null;
   activeBotStrategy: string | null;
+  // Global AI state (runs across all tabs)
+  globalAIRunning: boolean;
+  globalAIRankedMarkets: RankedMarket[];
+  globalAICycleCount: number;
+  globalAITotalTrades: number;
+  globalAITotalProfit: number;
+  globalAIStatus: 'idle' | 'scanning' | 'trading' | 'waiting';
+  globalAIHealth: ScannerHealth;
+  globalAILearningStats: { strategiesLearned: number; totalTradesRecorded: number; totalWins: number; totalLosses: number; totalProfit: number; winRate: number };
 
   setActiveTab: (tab: string) => void;
   setBalance: (balance: number) => void;
@@ -120,6 +131,15 @@ export interface WorldpadState {
   setActiveBotId: (id: string | null) => void;
   setActiveBotStrategy: (strategy: string | null) => void;
   resetBotSession: () => void;
+  // Global AI actions
+  setGlobalAIRunning: (val: boolean) => void;
+  setGlobalAIRankedMarkets: (markets: RankedMarket[]) => void;
+  setGlobalAICycleCount: (count: number) => void;
+  setGlobalAITotalTrades: (count: number) => void;
+  setGlobalAITotalProfit: (profit: number) => void;
+  setGlobalAIStatus: (status: 'idle' | 'scanning' | 'trading' | 'waiting') => void;
+  setGlobalAIHealth: (health: ScannerHealth) => void;
+  setGlobalAILearningStats: (stats: { strategiesLearned: number; totalTradesRecorded: number; totalWins: number; totalLosses: number; totalProfit: number; winRate: number }) => void;
 }
 
 const defaultBotConfig: BotConfig = {
@@ -184,6 +204,15 @@ export const useWorldpadStore = create<WorldpadState>((set) => ({
   botConsecutiveLosses: 0,
   activeBotId: null,
   activeBotStrategy: null,
+  // Global AI defaults
+  globalAIRunning: false,
+  globalAIRankedMarkets: [],
+  globalAICycleCount: 0,
+  globalAITotalTrades: 0,
+  globalAITotalProfit: 0,
+  globalAIStatus: 'idle' as const,
+  globalAIHealth: { isConnected: false, totalTicksReceived: 0, lastTickTime: 0, connectTime: 0, ticksPerMarket: {}, wsError: null, callbackCount: 0 },
+  globalAILearningStats: { strategiesLearned: 0, totalTradesRecorded: 0, totalWins: 0, totalLosses: 0, totalProfit: 0, winRate: 0 },
 
   setActiveTab: (tab) => set({ activeTab: tab }),
   setBalance: (balance) => set({ balance }),
@@ -266,4 +295,13 @@ export const useWorldpadStore = create<WorldpadState>((set) => ({
   setActiveBotId: (id) => set({ activeBotId: id }),
   setActiveBotStrategy: (strategy) => set({ activeBotStrategy: strategy }),
   resetBotSession: () => set({ botTradeCount: 0, botSessionProfit: 0, botConsecutiveLosses: 0, activeBotId: null, activeBotStrategy: null }),
+  // Global AI actions
+  setGlobalAIRunning: (val) => set({ globalAIRunning: val }),
+  setGlobalAIRankedMarkets: (markets) => set({ globalAIRankedMarkets: markets }),
+  setGlobalAICycleCount: (count) => set({ globalAICycleCount: count }),
+  setGlobalAITotalTrades: (count) => set({ globalAITotalTrades: count }),
+  setGlobalAITotalProfit: (profit) => set({ globalAITotalProfit: profit }),
+  setGlobalAIStatus: (status) => set({ globalAIStatus: status }),
+  setGlobalAIHealth: (health) => set({ globalAIHealth: health }),
+  setGlobalAILearningStats: (stats) => set({ globalAILearningStats: stats }),
 }));
