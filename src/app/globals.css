@@ -592,3 +592,6 @@
     linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
   background-size: 32px 32px;
 }
+
+/* AI Scanner Active Indicator */
+@keyframes wp-pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
