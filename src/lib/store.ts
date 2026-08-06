@@ -1,7 +1,17 @@
 import { create } from 'zustand';
 import type { DerivAccount } from './deriv-ws';
 import type { RankedMarket } from './market-scorer';
-import type { ScannerHealth } from '@/hooks/use-ai-bot';
+
+// ScannerHealth type (inlined to avoid circular dep with use-ai-bot.ts)
+export interface ScannerHealth {
+  isConnected: boolean;
+  totalTicksReceived: number;
+  lastTickTime: number;
+  connectTime: number;
+  ticksPerMarket: Record<string, number>;
+  wsError: string | null;
+  callbackCount: number;
+}
 
 export interface BotConfig {
   market: string;

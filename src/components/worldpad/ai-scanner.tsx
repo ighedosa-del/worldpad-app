@@ -3,8 +3,8 @@
 import { useMemo, useState } from 'react';
 import { Play, Square, Brain, Wifi, WifiOff, ChevronDown, ChevronUp, Trophy, TrendingUp, BarChart3, GraduationCap, Activity, AlertTriangle, Radio, ScrollText, CheckCircle2, XCircle, Clock } from 'lucide-react';
 import { SCANNED_MARKETS, getMarketData } from '@/lib/multi-market-ws';
-import { useWorldpadStore } from '@/lib/store';
-import type { RankedMarket, ScannerHealth } from '@/hooks/use-ai-bot';
+import { useWorldpadStore, type ScannerHealth } from '@/lib/store';
+import type { RankedMarket } from '@/lib/market-scorer';
 
 type StatusBadgeColor = 'scanning' | 'trading' | 'waiting' | 'idle';
 
