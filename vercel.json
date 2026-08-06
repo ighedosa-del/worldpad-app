@@ -1,1 +1,6 @@
-{"framework":"nextjs"}
+{
+  "framework": "nextjs",
+  "buildCommand": "npx next build --no-lint",
+  "installCommand": "npm install --prefer-offline",
+  "outputDirectory": ".next"
+}
