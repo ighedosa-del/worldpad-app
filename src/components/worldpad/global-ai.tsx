@@ -126,10 +126,17 @@ async function placeTradeDirect(params: {
 }
 
 /**
- * GlobalAI — invisible background component that runs the AI brain globally.
+ * GlobalAI v2 — invisible background component that runs the AI brain globally.
  * Mounted once in page.tsx. Scans all 10 markets, scores them, auto-trades,
  * and learns — regardless of which tab the user is on.
+ * v2: EV filtering, stop-loss, per-market cooldown, consensus, MATCH penalty
  */
+
+// v2: Per-market loss cooldown tracker (shared with use-ai-bot)
+const lossCooldownsGlobal: Map<string, number> = new Map();
+const LOSS_COOLDOWN_TICKS = 4;
+const marketTickCountsGlobal: Map<string, number> = new Map();
+
 export function GlobalAI() {
   const {
     isAuthorized, botConfig, addAutoTraderLog, addTradeResult,
@@ -147,6 +154,13 @@ export function GlobalAI() {
   const cycleCountRef = useRef(0);
   const lastRankingRef = useRef<RankedMarket[]>([]);
   const mountedRef = useRef(true);
+  const sessionWinsRef = useRef(0);
+  const sessionLossesRef = useRef(0);
+
+  // Init tick counters
+  for (const m of SCANNED_MARKETS) {
+    if (!marketTickCountsGlobal.has(m.symbol)) marketTickCountsGlobal.set(m.symbol, 0);
+  }
 
   // === Scoring ===
   const rankingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -172,14 +186,37 @@ export function GlobalAI() {
     }, 500);
   }, [doUpdateRanking]);
 
-  // Tick callback — feeds AI + triggers ranking
+  // Tick callback — feeds AI + triggers ranking + manages cooldowns
   useEffect(() => {
     const unsubscribe = addTickCallback((symbol, data) => {
       feedTickToAI(symbol, data);
       updateRankingThrottled();
+
+      // v2: Decrement cooldowns
+      const currentTicks = (marketTickCountsGlobal.get(symbol) || 0) + 1;
+      marketTickCountsGlobal.set(symbol, currentTicks);
+      const cdRemaining = lossCooldownsGlobal.get(symbol);
+      if (cdRemaining !== undefined && currentTicks >= cdRemaining) {
+        lossCooldownsGlobal.delete(symbol);
+      }
     });
     return unsubscribe;
   }, [updateRankingThrottled]);
+
+  // v2: Build cooldown set
+  const getCooldownSet = useCallback((): Set<string> => {
+    const set = new Set<string>();
+    for (const [symbol, untilTick] of lossCooldownsGlobal) {
+      if ((marketTickCountsGlobal.get(symbol) || 0) < untilTick) set.add(symbol);
+    }
+    return set;
+  }, []);
+
+  // v2: Stop-loss check
+  const isStopLossHit = useCallback((): boolean => {
+    if (botConfig.stopLoss <= 0) return false;
+    return totalProfitRef.current <= -botConfig.stopLoss;
+  }, [botConfig.stopLoss]);
 
   // === Trade execution ===
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
@@ -189,7 +226,8 @@ export function GlobalAI() {
 
     try {
       const signal = market.selectedSignal;
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}`;
+      const evStr = market.evAdjusted ? ` [EV:${market.expectedValue.toFixed(3)}]` : '';
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}${evStr}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -203,9 +241,21 @@ export function GlobalAI() {
 
       if (result) {
         const won = result.profit > 0;
+
+        // v2: Per-market loss cooldown
+        if (!won) {
+          const ct = marketTickCountsGlobal.get(market.symbol) || 0;
+          lossCooldownsGlobal.set(market.symbol, ct + LOSS_COOLDOWN_TICKS);
+          sessionLossesRef.current++;
+          sessionWinsRef.current = 0;
+        } else {
+          sessionWinsRef.current++;
+          sessionLossesRef.current = 0;
+        }
+
         addAutoTraderLog(won
-          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)}`
-          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)}`);
+          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current}`
+          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks`);
 
         aiEngine.recordTradeResult(
           market.symbol, signal.contractType, signal.barrier,
@@ -243,27 +293,53 @@ export function GlobalAI() {
   // === Main AI cycle ===
   const runCycle = useCallback(async () => {
     if (!runningRef.current) return;
+
+    // v2: STOP-LOSS ENFORCEMENT
+    if (isStopLossHit()) {
+      runningRef.current = false;
+      if (mountedRef.current) setGlobalAIRunning(false);
+      setGlobalAIStatus('idle');
+      addAutoTraderLog(`[AI] ⛔ STOP LOSS HIT: -$${Math.abs(totalProfitRef.current).toFixed(2)} exceeded $${botConfig.stopLoss} limit. Bot stopped.`);
+      addAutoTraderLog(`[AI] Session: ${totalTradesRef.current} trades | W:${sessionWinsRef.current} L:${sessionLossesRef.current}`);
+      aiEngine.saveLearningData();
+      return;
+    }
+
     setGlobalAIStatus('scanning');
 
     const ranked = lastRankingRef.current;
     if (ranked.length === 0) { setGlobalAIStatus('waiting'); return; }
 
-    const trades = selectTrades(ranked, {}, new Set(activeTradesRef.current.keys()));
+    // v2: Pass cooldown set
+    const cooldownSet = getCooldownSet();
+    const trades = selectTrades(ranked, {}, new Set(activeTradesRef.current.keys()), cooldownSet);
     if (trades.length === 0) { setGlobalAIStatus('waiting'); return; }
 
     setGlobalAIStatus('trading');
     cycleCountRef.current += 1;
     if (mountedRef.current) setGlobalAICycleCount(cycleCountRef.current);
 
+    // v2: Log EV summary for each trade
+    for (const t of trades) {
+      if (t.selectedSignal) {
+        addAutoTraderLog(`[AI] → ${t.name}: ${t.selectedSignal.contractType} d${t.selectedSignal.barrier ?? '-'} | EV=${t.expectedValue.toFixed(3)} | score=${t.combinedScore.toFixed(0)} | conf=${Math.round((t.selectedSignal.confidence || 0) * 100)}%`);
+      }
+    }
+
     // Fire all trades in parallel (per-market locks prevent duplicates)
     const promises = trades.map(trade => executeTradeOnMarket(trade, botConfig.stake));
     await Promise.all(promises);
 
     setGlobalAIStatus('waiting');
-  }, [executeTradeOnMarket, botConfig.stake, setGlobalAIStatus, setGlobalAICycleCount]);
+  }, [executeTradeOnMarket, botConfig.stake, botConfig.stopLoss, setGlobalAIStatus, setGlobalAICycleCount, isStopLossHit, getCooldownSet]);
 
   // === Start / Stop ===
   const startBot = useCallback(() => {
+    // v2: Reset everything on fresh start
+    lossCooldownsGlobal.clear();
+    sessionWinsRef.current = 0;
+    sessionLossesRef.current = 0;
+
     aiEngine.loadLearningData();
     setGlobalAILearningStats(aiEngine.getLearningStats());
     runningRef.current = true;
@@ -278,15 +354,19 @@ export function GlobalAI() {
     setGlobalAITotalProfit(0);
 
     const simMode = isSimulating() || !isAuthorized;
-    addAutoTraderLog(`[AI] === GLOBAL AI STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    addAutoTraderLog(`[AI] === GLOBAL AI v2 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 10 | Max concurrent: 10`);
+    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score: 30 | Max concurrent: 10`);
+    addAutoTraderLog(`[AI] v2: EV filter ON | MATCH penalty ON | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks | Consensus ON`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
 
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
       if (runningRef.current) {
-        cycleTimerRef.current = setTimeout(runLoop, 3000);
+        // v2: 4s cycle (was 3s) — more selective
+        cycleTimerRef.current = setTimeout(runLoop, 4000);
       }
     };
     runLoop();
@@ -300,7 +380,11 @@ export function GlobalAI() {
     activeTradesRef.current.clear();
     tradeLocksRef.current.clear();
     pendingSimTradesGlobal.clear();
-    addAutoTraderLog(`[AI] === GLOBAL AI STOPPED === | Cycles: ${cycleCountRef.current} | Trades: ${totalTradesRef.current} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    addAutoTraderLog(`[AI] === GLOBAL AI v2 STOPPED ===`);
+    addAutoTraderLog(`[AI] Cycles: ${cycleCountRef.current} | Trades: ${totalTradesRef.current} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
+    addAutoTraderLog(`[AI] Session W/L: ${sessionWinsRef.current}/${sessionLossesRef.current}`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
     aiEngine.saveLearningData();
   }, [addAutoTraderLog, setGlobalAIRunning, setGlobalAIStatus]);
 

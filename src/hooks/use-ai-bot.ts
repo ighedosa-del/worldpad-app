@@ -32,8 +32,16 @@ export interface AIBotState {
   scannerConnected: boolean;
   scannerHealth: ScannerHealth;
   lastCycleTime: number;
-  status: 'idle' | 'scanning' | 'trading' | 'waiting';
+  status: 'idle' | 'scanning' | 'trading' | 'waiting' | 'stopped';
 }
+
+// v2: Per-market loss cooldown tracker
+// symbol -> tick count until cooldown expires
+const lossCooldowns: Map<string, number> = new Map();
+const LOSS_COOLDOWN_TICKS = 4; // skip 4 ticks after a loss on a market
+
+// Track per-market tick counts for cooldown decrementing
+const marketTickCounts: Map<string, number> = new Map();
 
 export function useAIBot() {
   const {
@@ -54,20 +62,24 @@ export function useAIBot() {
   const [cycleCount, setCycleCount] = useState(0);
   const [totalTradesPlaced, setTotalTradesPlaced] = useState(0);
   const [learningStats, setLearningStats] = useState(aiEngine.getLearningStats());
+  const [stopLossHit, setStopLossHit] = useState(false); // v2
 
   // Refs
   const runningRef = useRef(false);
   const cycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeTradesRef = useRef<Map<string, { signal: any; startedAt: number }>>(new Map());
-  const tradeLocksRef = useRef<Set<string>>(new Set()); // per-market locks
+  const tradeLocksRef = useRef<Set<string>>(new Set());
   const totalProfitRef = useRef(0);
   const tickDataRef = useRef<Map<string, MarketTickData | null>>(new Map());
   const lastRankingRef = useRef<RankedMarket[]>([]);
   const mountedRef = useRef(true);
+  const sessionLossCountRef = useRef(0); // v2: track consecutive losses
+  const sessionWinCountRef = useRef(0);
 
   // Initialize tick data map
   for (const m of SCANNED_MARKETS) {
     tickDataRef.current.set(m.symbol, null);
+    if (!marketTickCounts.has(m.symbol)) marketTickCounts.set(m.symbol, 0);
   }
 
   // === CORE: Force re-score all markets ===
@@ -94,12 +106,23 @@ export function useAIBot() {
     }, 500);
   }, [doUpdateRanking]);
 
-  // Tick callback — feeds AI + triggers ranking
+  // Tick callback — feeds AI + triggers ranking + decrements cooldowns
   useEffect(() => {
     const unsubscribe = addTickCallback((symbol, data) => {
       tickDataRef.current.set(symbol, data.lastTick);
       feedTickToAI(symbol, data);
       updateRankingThrottled();
+
+      // v2: Increment tick count and decrement cooldown for this market
+      const currentTicks = (marketTickCounts.get(symbol) || 0) + 1;
+      marketTickCounts.set(symbol, currentTicks);
+
+      const cooldownRemaining = lossCooldowns.get(symbol);
+      if (cooldownRemaining !== undefined) {
+        if (currentTicks >= cooldownRemaining) {
+          lossCooldowns.delete(symbol);
+        }
+      }
     });
     return unsubscribe;
   }, [updateRankingThrottled]);
@@ -117,6 +140,24 @@ export function useAIBot() {
     return () => clearInterval(interval);
   }, [doUpdateRanking]);
 
+  // v2: Build the set of symbols currently in cooldown
+  const getCooldownSet = useCallback((): Set<string> => {
+    const cooldownSet = new Set<string>();
+    for (const [symbol, cooldownUntilTick] of lossCooldowns) {
+      const currentTicks = marketTickCounts.get(symbol) || 0;
+      if (currentTicks < cooldownUntilTick) {
+        cooldownSet.add(symbol);
+      }
+    }
+    return cooldownSet;
+  }, []);
+
+  // v2: Put a market into loss cooldown
+  const startCooldown = useCallback((symbol: string) => {
+    const currentTicks = marketTickCounts.get(symbol) || 0;
+    lossCooldowns.set(symbol, currentTicks + LOSS_COOLDOWN_TICKS);
+  }, []);
+
   // Execute a trade on a specific market (per-market lock)
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
     if (!market.selectedSignal) return;
@@ -125,7 +166,8 @@ export function useAIBot() {
 
     try {
       const signal = market.selectedSignal;
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}`;
+      const evStr = market.evAdjusted ? ` [EV: ${market.expectedValue.toFixed(3)}]` : '';
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}${evStr}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -141,9 +183,22 @@ export function useAIBot() {
 
       if (result) {
         const won = result.profit > 0;
+
+        // v2: Per-market loss cooldown
+        if (!won) {
+          startCooldown(market.symbol);
+          sessionLossCountRef.current++;
+          // v2: Reset win streak on loss
+          sessionWinCountRef.current = 0;
+        } else {
+          sessionWinCountRef.current++;
+          // v2: Reset loss streak on win
+          sessionLossCountRef.current = 0;
+        }
+
         const logResult = won
-          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)}`
-          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)}`;
+          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current}`
+          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks`;
         addAutoTraderLog(logResult);
 
         // Record to AI engine for learning
@@ -175,26 +230,68 @@ export function useAIBot() {
       activeTradesRef.current.delete(market.symbol);
       tradeLocksRef.current.delete(market.symbol);
     }
-  }, [placeTrade, addAutoTraderLog, addTradeResult]);
+  }, [placeTrade, addAutoTraderLog, addTradeResult, startCooldown]);
+
+  // v2: Stop-loss check
+  const isStopLossHit = useCallback((): boolean => {
+    const stopLoss = botConfig.stopLoss;
+    if (stopLoss <= 0) return false; // stop loss disabled
+    return totalProfitRef.current <= -stopLoss;
+  }, [botConfig.stopLoss]);
 
   // Main AI bot cycle
   const runCycle = useCallback(async () => {
     if (!runningRef.current) return;
+
+    // v2: STOP-LOSS ENFORCEMENT — hard halt if loss exceeds limit
+    if (isStopLossHit()) {
+      setStatus('stopped');
+      setStopLossHit(true);
+      runningRef.current = false;
+      setIsRunning(false);
+      addAutoTraderLog(`[AI] ⛔ STOP LOSS HIT: -$${Math.abs(totalProfitRef.current).toFixed(2)} exceeded $${botConfig.stopLoss} limit. Bot stopped.`);
+      addAutoTraderLog(`[AI] Session stats: ${totalTradesPlaced} trades | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current}`);
+      aiEngine.saveLearningData();
+      return;
+    }
+
     setStatus('scanning');
     const ranked = lastRankingRef.current;
     if (ranked.length === 0) { setStatus('waiting'); return; }
-    const trades = selectTrades(ranked, {}, new Set(activeTradesRef.current.keys()));
-    if (trades.length === 0) { setStatus('waiting'); return; }
+
+    // v2: Pass cooldown set to selectTrades
+    const cooldownSet = getCooldownSet();
+    const trades = selectTrades(ranked, {}, new Set(activeTradesRef.current.keys()), cooldownSet);
+
+    if (trades.length === 0) {
+      setStatus('waiting');
+      return;
+    }
+
     setStatus('trading');
     setCycleCount(prev => prev + 1);
+
+    // v2: Log EV summary for selected trades
+    for (const t of trades) {
+      if (t.selectedSignal) {
+        addAutoTraderLog(`[AI] → ${t.name}: ${t.selectedSignal.contractType} d${t.selectedSignal.barrier ?? '-'} | EV=${t.expectedValue.toFixed(3)} | score=${t.combinedScore.toFixed(0)} | conf=${Math.round((t.selectedSignal.confidence || 0) * 100)}%`);
+      }
+    }
+
     for (const trade of trades) {
       await executeTradeOnMarket(trade, botConfig.stake);
     }
     setStatus('waiting');
-  }, [executeTradeOnMarket, botConfig.stake]);
+  }, [executeTradeOnMarket, botConfig.stake, botConfig.stopLoss, addAutoTraderLog, isStopLossHit, getCooldownSet, totalTradesPlaced]);
 
   // Start the AI bot
   const startBot = useCallback(() => {
+    // v2: Clear all cooldowns on fresh start
+    lossCooldowns.clear();
+    sessionLossCountRef.current = 0;
+    sessionWinCountRef.current = 0;
+    setStopLossHit(false);
+
     aiEngine.loadLearningData();
     setLearningStats(aiEngine.getLearningStats());
     runningRef.current = true;
@@ -204,14 +301,19 @@ export function useAIBot() {
     setTotalTradesPlaced(0);
     activeTradesRef.current.clear();
     const simMode = isSimulating() || !isAuthorized;
-    addAutoTraderLog(`[AI] === AI BOT STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    addAutoTraderLog(`[AI] === AI BOT v2 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 10 | Max concurrent: 10`);
+    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score: 30 | Max concurrent: 10`);
+    addAutoTraderLog(`[AI] v2: EV filtering ON | MATCH penalty ON | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks | Consensus bonus ON`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
       if (runningRef.current) {
-        cycleTimerRef.current = setTimeout(runLoop, 2500);
+        // v2: 4s cycle (was 2.5s) — slower = more selective
+        cycleTimerRef.current = setTimeout(runLoop, 4000);
       }
     };
     runLoop();
@@ -228,9 +330,13 @@ export function useAIBot() {
       if (mountedRef.current) startMultiMarketScan();
     }, 500);
     activeTradesRef.current.clear();
-    addAutoTraderLog(`[AI] === AI BOT STOPPED === | Cycles: ${cycleCount} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    addAutoTraderLog(`[AI] === AI BOT v2 STOPPED ===`);
+    addAutoTraderLog(`[AI] Cycles: ${cycleCount} | Trades: ${totalTradesPlaced} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
+    addAutoTraderLog(`[AI] Session W/L: ${sessionWinCountRef.current}/${sessionLossCountRef.current}`);
+    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
     aiEngine.saveLearningData();
-  }, [addAutoTraderLog, cycleCount]);
+  }, [addAutoTraderLog, cycleCount, totalTradesPlaced]);
 
   // Start scanning on mount
   useEffect(() => {
@@ -250,6 +356,6 @@ export function useAIBot() {
     isRunning, rankedMarkets, scannerConnected, scannerHealth,
     status, cycleCount, totalTradesPlaced,
     totalProfit: totalProfitRef.current,
-    learningStats, startBot, stopBot,
+    learningStats, startBot, stopBot, stopLossHit,
   };
 }
