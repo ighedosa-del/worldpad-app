@@ -54,12 +54,20 @@ class AIEngine {
   private totalTradesRecorded = 0;
 
   // Load persisted learning data from localStorage
+  // v2: Auto-wipes old data from pre-v2 (poisoned by the wrong-digit bug)
   loadLearningData() {
     if (typeof window === 'undefined') return;
     try {
+      const LEARNING_VERSION = 2; // bump this to force a brain wipe
       const saved = localStorage.getItem('wp-ai-learning');
       if (saved) {
         const data = JSON.parse(saved);
+        // If version mismatch or no version field, wipe old data
+        if ((data.version || 1) < LEARNING_VERSION) {
+          console.log(`[AI] Wiping old v${data.version || 1} learning data (incompatible with v2 engine)`);
+          localStorage.removeItem('wp-ai-learning');
+          return;
+        }
         if (data.strategyStats) {
           this.strategyStats = new Map(Object.entries(data.strategyStats));
         }
@@ -74,6 +82,7 @@ class AIEngine {
     if (typeof window === 'undefined') return;
     try {
       const data = {
+        version: 2,
         strategyStats: Object.fromEntries(this.strategyStats),
         totalTradesRecorded: this.totalTradesRecorded,
       };
