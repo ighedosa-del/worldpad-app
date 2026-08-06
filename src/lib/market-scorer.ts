@@ -29,8 +29,8 @@ export interface ScoringConfig {
 const DEFAULT_CONFIG: ScoringConfig = {
   logicWeight: 0.6,
   aiWeight: 0.4,
-  minScore: 55,
-  maxConcurrentTrades: 2,
+  minScore: 20,
+  maxConcurrentTrades: 3,
 };
 
 // Feed tick data to the AI engine (called on every tick)
