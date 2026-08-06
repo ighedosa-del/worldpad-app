@@ -47,9 +47,11 @@ function registerGlobalTickListener() {
       default: won = Math.random() > 0.5;
     }
 
+    // Payout: Deriv pays net profit multiplier on win, 0 on loss
     const isMatch = contractType === 'DIGITMATCH';
-    const payout = won ? stake * (isMatch ? 8.5 : 0.85) : 0;
-    const profit = payout - stake;
+    const profitMultiplier = isMatch ? 8.5 : 0.85;
+    const profit = won ? stake * profitMultiplier : -stake;
+    const payout = won ? stake + profit : 0;
 
     const result: TradeResult = {
       id: `SIM-${Date.now()}`,
