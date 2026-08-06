@@ -6,6 +6,8 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  // Force unique build output to bust Vercel cache
+  generateBuildId: async () => `wp_${Date.now()}`,
 };
 
 export default nextConfig;
