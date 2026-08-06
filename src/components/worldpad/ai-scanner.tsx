@@ -1,8 +1,8 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Play, Square, Brain, Wifi, WifiOff, ChevronDown, ChevronUp, Trophy, TrendingUp, BarChart3, GraduationCap, Activity } from 'lucide-react';
-import { useAIBot } from '@/hooks/use-ai-bot';
+import { Play, Square, Brain, Wifi, WifiOff, ChevronDown, ChevronUp, Trophy, TrendingUp, BarChart3, GraduationCap, Activity, AlertTriangle, Radio } from 'lucide-react';
+import { useAIBot, type ScannerHealth } from '@/hooks/use-ai-bot';
 import { SCANNED_MARKETS, getMarketData } from '@/lib/multi-market-ws';
 
 type StatusBadgeColor = 'scanning' | 'trading' | 'waiting' | 'idle';
@@ -24,12 +24,14 @@ function getRankColor(rank: number): string {
 function getScoreColor(score: number): string {
   if (score > 70) return '#22c55e';
   if (score > 50) return '#eab308';
+  if (score > 0) return '#f97316';
   return '#6b7280';
 }
 
 function getScoreBarColor(score: number): string {
   if (score > 70) return 'linear-gradient(90deg, #16a34a, #22c55e)';
   if (score > 50) return 'linear-gradient(90deg, #ca8a04, #eab308)';
+  if (score > 0) return 'linear-gradient(90deg, #ea580c, #f97316)';
   return 'linear-gradient(90deg, #4b5563, #6b7280)';
 }
 
@@ -61,15 +63,20 @@ function MiniStat({ label, value }: { label: string; value: number }) {
 function MarketCard({
   market,
   lastDigit,
+  tickCount,
+  maxTicks,
 }: {
   market: ReturnType<typeof useAIBot>['rankedMarkets'][number];
   lastDigit: number | null;
+  tickCount: number;
+  maxTicks: number;
 }) {
   const { rank, name, type, combinedScore, logicScore, aiScore, selectedSignal } = market;
   const top = isTopSignal(market);
   const scoreColor = getScoreColor(combinedScore);
   const barGradient = getScoreBarColor(combinedScore);
   const rankColor = getRankColor(rank);
+  const collectPct = Math.min(100, (tickCount / maxTicks) * 100);
 
   return (
     <div
@@ -94,12 +101,12 @@ function MarketCard({
         />
       )}
 
-      {/* Header: Market name + rank + last digit */}
-      <div className="flex items-start justify-between mb-3">
+      {/* Header: Market name + rank + last digit + tick count */}
+      <div className="flex items-start justify-between mb-2">
         <div className="flex items-center gap-2">
           {/* Rank badge */}
           <div
-            className="flex items-center justify-center w-8 h-8 rounded-lg text-sm font-black"
+            className="flex items-center justify-center w-7 h-7 rounded-lg text-xs font-black"
             style={{
               color: rankColor,
               background: `${rankColor}15`,
@@ -107,11 +114,11 @@ function MarketCard({
               textShadow: rank <= 3 ? `0 0 8px ${rankColor}60` : 'none',
             }}
           >
-            {rank <= 3 && <Trophy className="w-3 h-3 mr-0.5" style={{ color: rankColor }} />}
+            {rank <= 3 && <Trophy className="w-2.5 h-2.5 mr-0.5" style={{ color: rankColor }} />}
             {rank}
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <span className="text-white text-sm font-semibold">{name}</span>
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded-full font-bold uppercase"
@@ -127,24 +134,52 @@ function MarketCard({
           </div>
         </div>
 
-        {/* Last digit */}
-        <div
-          className="flex items-center justify-center w-9 h-9 rounded-lg font-mono text-lg font-black"
-          style={{
-            background: 'rgba(255,255,255,0.04)',
-            border: '1px solid #30363d',
-            color: lastDigit !== null ? '#e2e8f0' : '#374151',
-          }}
-        >
-          {lastDigit !== null ? lastDigit : '–'}
+        <div className="flex items-center gap-2">
+          {/* Tick count badge */}
+          <div className="flex items-center gap-1 px-1.5 py-0.5 rounded-md" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid #30363d' }}>
+            <Radio className="w-2.5 h-2.5" style={{ color: tickCount > 0 ? '#22c55e' : '#374151' }} />
+            <span className="text-[10px] font-mono font-bold" style={{ color: tickCount > 0 ? '#9ca3af' : '#374151' }}>
+              {tickCount}
+            </span>
+          </div>
+          {/* Last digit */}
+          <div
+            className="flex items-center justify-center w-8 h-8 rounded-lg font-mono text-base font-black"
+            style={{
+              background: 'rgba(255,255,255,0.04)',
+              border: '1px solid #30363d',
+              color: lastDigit !== null ? '#e2e8f0' : '#374151',
+            }}
+          >
+            {lastDigit !== null ? lastDigit : '–'}
+          </div>
         </div>
       </div>
 
+      {/* Data collection progress bar */}
+      {tickCount < maxTicks && (
+        <div className="mb-2">
+          <div className="flex items-center justify-between mb-0.5">
+            <span className="text-[9px] text-gray-600">Collecting data</span>
+            <span className="text-[9px] font-mono text-gray-600">{tickCount}/{maxTicks}</span>
+          </div>
+          <div className="w-full h-1 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.04)' }}>
+            <div
+              className="h-full rounded-full transition-all duration-500"
+              style={{
+                width: `${collectPct}%`,
+                background: 'linear-gradient(90deg, #3b82f6, #60a5fa)',
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Combined score */}
-      <div className="mb-3">
-        <div className="flex items-end gap-2 mb-1.5">
+      <div className="mb-2">
+        <div className="flex items-end gap-2 mb-1">
           <span
-            className="text-3xl font-black font-mono leading-none"
+            className="text-2xl font-black font-mono leading-none"
             style={{ color: scoreColor, textShadow: `0 0 12px ${scoreColor}40` }}
           >
             {combinedScore.toFixed(0)}
@@ -168,22 +203,22 @@ function MarketCard({
       </div>
 
       {/* Logic + AI sub-scores */}
-      <div className="grid grid-cols-2 gap-2 mb-3">
+      <div className="grid grid-cols-2 gap-2 mb-2">
         <div
-          className="rounded-lg p-2"
+          className="rounded-lg p-1.5"
           style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}
         >
-          <div className="flex items-center gap-1 mb-1">
+          <div className="flex items-center gap-1 mb-0.5">
             <BarChart3 className="w-3 h-3 text-blue-400" />
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Logic</span>
+            <span className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider">Logic</span>
           </div>
           <span
-            className="text-base font-bold font-mono"
+            className="text-sm font-bold font-mono"
             style={{ color: getScoreColor(logicScore.score) }}
           >
             {logicScore.score.toFixed(0)}
           </span>
-          <div className="grid grid-cols-4 gap-1 mt-1.5">
+          <div className="grid grid-cols-4 gap-0.5 mt-1">
             <MiniStat label="Freq" value={logicScore.components.frequencyDeviation} />
             <MiniStat label="Strk" value={logicScore.components.streakScore} />
             <MiniStat label="Bal" value={logicScore.components.balanceScore} />
@@ -192,20 +227,20 @@ function MarketCard({
         </div>
 
         <div
-          className="rounded-lg p-2"
+          className="rounded-lg p-1.5"
           style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}
         >
-          <div className="flex items-center gap-1 mb-1">
+          <div className="flex items-center gap-1 mb-0.5">
             <Brain className="w-3 h-3 text-purple-400" />
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">AI</span>
+            <span className="text-[9px] font-semibold text-gray-400 uppercase tracking-wider">AI</span>
           </div>
           <span
-            className="text-base font-bold font-mono"
+            className="text-sm font-bold font-mono"
             style={{ color: getScoreColor(aiScore.score) }}
           >
             {aiScore.score.toFixed(0)}
           </span>
-          <div className="grid grid-cols-4 gap-1 mt-1.5">
+          <div className="grid grid-cols-4 gap-0.5 mt-1">
             <MiniStat label="Mkv" value={aiScore.components.markovScore} />
             <MiniStat label="Ent" value={aiScore.components.entropyScore} />
             <MiniStat label="Bay" value={aiScore.components.bayesianScore} />
@@ -239,6 +274,56 @@ function MarketCard({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function HealthBanner({ health, isRunning }: { health: ScannerHealth; isRunning: boolean }) {
+  const secondsSinceConnect = health.connectTime > 0 ? Math.floor((Date.now() - health.connectTime) / 1000) : 0;
+  const secondsSinceTick = health.lastTickTime > 0 ? Math.floor((Date.now() - health.lastTickTime) / 1000) : 999;
+  const totalTicks = Object.values(health.ticksPerMarket).reduce((a, b) => a + b, 0);
+
+  // Warning states
+  const noTicksAfterConnect = secondsSinceConnect > 5 && totalTicks === 0;
+  const staleTicks = secondsSinceTick > 10 && totalTicks > 0;
+  const hasError = !!health.wsError;
+  const noCallbacks = health.callbackCount === 0;
+
+  if (!isRunning && !hasError && totalTicks === 0) {
+    return null; // Don't show health banner when idle with no data
+  }
+
+  const showWarning = noTicksAfterConnect || staleTicks || hasError || noCallbacks;
+
+  if (!showWarning && totalTicks > 0) {
+    return null; // Everything is fine, no banner needed
+  }
+
+  return (
+    <div
+      className="flex items-center gap-2 px-3 py-2 rounded-lg"
+      style={{
+        background: hasError ? 'rgba(239,68,68,0.08)' : 'rgba(234,179,8,0.08)',
+        border: `1px solid ${hasError ? 'rgba(239,68,68,0.2)' : 'rgba(234,179,8,0.15)'}`,
+      }}
+    >
+      <AlertTriangle className="w-4 h-4 shrink-0" style={{ color: hasError ? '#ef4444' : '#eab308' }} />
+      <div className="flex-1 min-w-0">
+        <div className="text-xs font-medium" style={{ color: hasError ? '#fca5a5' : '#fde68a' }}>
+          {hasError
+            ? `Connection issue: ${health.wsError}`
+            : noTicksAfterConnect
+              ? `Connected ${secondsSinceConnect}s ago but no ticks received yet. Waiting for Deriv data...`
+              : staleTicks
+                ? `Last tick was ${secondsSinceTick}s ago. Data may be stale.`
+                : noCallbacks
+                  ? 'No tick listeners active — data collection may not work.'
+                  : 'Initializing scanner...'}
+        </div>
+        <div className="text-[10px] text-gray-500 mt-0.5">
+          WS: {health.isConnected ? 'OPEN' : 'CLOSED'} | Total ticks: {totalTicks} | Callbacks: {health.callbackCount}
+        </div>
+      </div>
     </div>
   );
 }
@@ -298,7 +383,6 @@ function LearningPanel({ learningStats }: { learningStats: ReturnType<typeof use
                   {winRate.toFixed(1)}%
                 </span>
               </div>
-              {/* Win rate progress bar */}
               <div
                 className="w-full h-1.5 rounded-full overflow-hidden mt-1"
                 style={{ background: 'rgba(255,255,255,0.06)' }}
@@ -345,6 +429,7 @@ export function AIScanner() {
     isRunning,
     rankedMarkets,
     scannerConnected,
+    scannerHealth,
     status,
     cycleCount,
     totalTradesPlaced,
@@ -354,26 +439,20 @@ export function AIScanner() {
     stopBot,
   } = useAIBot();
 
-  // Get last digit + tick count per market
-  const marketDigits = useMemo(() => {
-    const map: Record<string, number | null> = {};
+  // Get live tick data per market (reads module-level data directly)
+  const marketLive = useMemo(() => {
+    const map: Record<string, { lastDigit: number | null; tickCount: number }> = {};
     for (const m of SCANNED_MARKETS) {
       const data = getMarketData(m.symbol);
-      map[m.symbol] = data.lastTick?.digit ?? null;
+      map[m.symbol] = {
+        lastDigit: data.lastTick?.digit ?? null,
+        tickCount: data.tickCount,
+      };
     }
     return map;
   });
 
-  const marketTickCounts = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const m of SCANNED_MARKETS) {
-      const data = getMarketData(m.symbol);
-      map[m.symbol] = data.tickCount;
-    }
-    return map;
-  });
-
-  // Build a map of ranked markets by symbol for quick lookup
+  // Build a map of ranked markets by symbol
   const rankedMap = useMemo(() => {
     const map: Record<string, (typeof rankedMarkets)[number]> = {};
     for (const m of rankedMarkets) {
@@ -382,7 +461,7 @@ export function AIScanner() {
     return map;
   }, [rankedMarkets]);
 
-  // Merge SCANNED_MARKETS with ranked data (so all 10 are always shown)
+  // Merge SCANNED_MARKETS with ranked data (all 10 always shown)
   const displayMarkets = useMemo(() => {
     return SCANNED_MARKETS.map((m, i) => {
       const ranked = rankedMap[m.symbol];
@@ -400,9 +479,11 @@ export function AIScanner() {
   }, [rankedMarkets, rankedMap]);
 
   const statusStyle = STATUS_STYLES[status];
+  const totalTicksAll = Object.values(marketLive).reduce((sum, m) => sum + m.tickCount, 0);
+  const maxTicksNeeded = 50; // AI needs 50 ticks, logic needs 30
 
   return (
-    <div className="h-[calc(100vh-52px)] flex flex-col overflow-hidden p-4 gap-4">
+    <div className="h-[calc(100vh-52px)] flex flex-col overflow-hidden p-4 gap-3">
       {/* Header Bar */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
@@ -415,6 +496,7 @@ export function AIScanner() {
             <span className="text-[10px] font-bold text-purple-400" style={{ textShadow: '0 0 8px rgba(168,85,247,0.5)' }}>AI</span>
           </div>
           <h1 className="text-white text-lg font-bold">AI Scanner</h1>
+          <span className="text-[10px] font-mono text-gray-500">{totalTicksAll} ticks</span>
         </div>
 
         <div className="flex items-center gap-3">
@@ -460,7 +542,7 @@ export function AIScanner() {
         >
           <StatItem label="Cycles" value={cycleCount.toString()} color="#e2e8f0" />
           <div className="w-px h-6 bg-[#30363d] shrink-0" />
-          <StatItem label="Trades Placed" value={totalTradesPlaced.toString()} color="#e2e8f0" />
+          <StatItem label="Trades" value={totalTradesPlaced.toString()} color="#e2e8f0" />
           <div className="w-px h-6 bg-[#30363d] shrink-0" />
           <StatItem
             label="P/L"
@@ -475,6 +557,8 @@ export function AIScanner() {
           />
           <div className="w-px h-6 bg-[#30363d] shrink-0" />
           <StatItem label="Strategies" value={learningStats.strategiesLearned.toString()} color="#a855f7" />
+          <div className="w-px h-6 bg-[#30363d] shrink-0" />
+          <StatItem label="Ticks" value={totalTicksAll.toString()} color="#3b82f6" />
           <div className="w-px h-6 bg-[#30363d] shrink-0" />
           {/* Status badge */}
           <div
@@ -493,19 +577,27 @@ export function AIScanner() {
 
       {/* Market Grid */}
       <div className="flex-1 overflow-y-auto wp-scroll">
-        {/* Data loading banner */
-        {scannerConnected && displayMarkets.every(m => marketTickCounts[m.symbol] < 30) && (
+        {/* Health warning banner */}
+        <HealthBanner health={scannerHealth} isRunning={isRunning || scannerConnected} />
+
+        {/* Data loading banner */}
+        {scannerConnected && totalTicksAll > 0 && totalTicksAll < 300 && (
           <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg" style={{ background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.15)' }}>
             <Activity className="w-4 h-4 text-blue-400 animate-pulse" />
-            <span className="text-xs text-blue-300">Collecting tick data — signals appear after ~30 ticks per market. Current max: {Math.max(...Object.values(marketTickCounts))} ticks</span>
+            <span className="text-xs text-blue-300">
+              Collecting tick data — Logic signals at 30 ticks, AI signals at 50 ticks per market. Total: {totalTicksAll} ticks across all markets
+            </span>
           </div>
         )}
+
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
           {displayMarkets.map((market) => (
             <MarketCard
               key={market.symbol}
               market={market}
-              lastDigit={marketDigits[market.symbol] ?? null}
+              lastDigit={marketLive[market.symbol]?.lastDigit ?? null}
+              tickCount={marketLive[market.symbol]?.tickCount ?? 0}
+              maxTicks={maxTicksNeeded}
             />
           ))}
         </div>

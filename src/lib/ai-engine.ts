@@ -34,7 +34,7 @@ interface StrategyRecord {
 
 type StrategyKey = string; // `${symbol}:${contractType}:${barrier}`
 
-const MIN_DIGITS_FOR_AI = 50;
+const MIN_DIGITS_FOR_AI = 20;
 const EXPECTED_ENTROPY = 3.32193; // log2(10) — entropy of uniform distribution
 const MARKOV_DECAY = 0.995;       // EMA decay for Markov updates (recent data weighted more)
 const BAYESIAN_PSEUDO_COUNT = 2;  // Pseudo-count for Bayesian prior (smoothing)

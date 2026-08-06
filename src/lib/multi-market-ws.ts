@@ -50,6 +50,10 @@ let tickCallbacks: Set<OnMarketTickCallback> = new Set();
 let subscriptionIds: Map<string, number> = new Map();
 let isConnected = false;
 let intentionalClose = false;
+let totalTicksReceived = 0;
+let lastTickTime = 0;
+let connectTime = 0;
+let wsError: string | null = null;
 
 function initMarketData(): MarketDataMap {
   const data = {} as MarketDataMap;
@@ -97,17 +101,31 @@ function handleMessage(event: MessageEvent) {
       if (md.digits.length > MAX_DIGITS) md.digits.shift();
       md.lastTick = { digit: lastDigit, price: msg.tick.quote, timestamp: Date.now() };
       md.tickCount++;
+      totalTicksReceived++;
+      lastTickTime = Date.now();
       recalcDistribution(md);
 
       // Notify all listeners
       for (const cb of tickCallbacks) {
-        cb(symbol, { ...md }); // shallow copy to avoid mutation issues
+        try {
+          cb(symbol, { ...md });
+        } catch (err) {
+          console.warn('[MultiMarketWS] Tick callback error:', err);
+        }
       }
     }
 
     // Track subscription IDs
     if (msg.subscription && msg.msg_type === 'tick') {
       subscriptionIds.set(msg.tick.symbol, msg.subscription.id);
+    }
+
+    // Log non-tick messages for debugging (first few)
+    if (msg.msg_type && msg.msg_type !== 'tick') {
+      if (msg.error) {
+        console.warn('[MultiMarketWS] API Error:', msg.msg_type, msg.error);
+        wsError = `API: ${msg.error.message || msg.error.code}`;
+      }
     }
   } catch {
     // ignore parse errors
@@ -117,36 +135,50 @@ function handleMessage(event: MessageEvent) {
 function connectInternal() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+  wsError = null;
+  connectTime = Date.now();
+
   try {
     ws = new WebSocket(DERIV_PUBLIC_WS);
-  } catch {
+  } catch (e) {
+    wsError = `WS create failed: ${(e as Error).message}`;
+    console.error('[MultiMarketWS]', wsError);
     scheduleReconnect();
     return;
   }
 
   ws.onopen = () => {
     isConnected = true;
-    console.log('[MultiMarketWS] Connected — subscribing to', SCANNED_MARKETS.length, 'markets');
+    console.log('[MultiMarketWS] Connected to Deriv WS — subscribing to', SCANNED_MARKETS.length, 'markets');
 
-    // Subscribe to all markets
-    for (const m of SCANNED_MARKETS) {
-      ws?.send(JSON.stringify({ ticks: m.symbol, subscribe: 1 }));
-      marketData[m.symbol].connected = true;
-    }
+    // Stagger subscriptions to avoid rate limiting
+    SCANNED_MARKETS.forEach((m, i) => {
+      setTimeout(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          const msg = JSON.stringify({ ticks: m.symbol, subscribe: 1 });
+          ws.send(msg);
+          console.log('[MultiMarketWS] Subscribed:', m.symbol);
+        }
+      }, i * 100);
+    });
   };
 
   ws.onmessage = handleMessage;
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    console.log('[MultiMarketWS] Closed:', event.code, event.reason || 'no reason');
     isConnected = false;
     for (const m of SCANNED_MARKETS) {
       marketData[m.symbol].connected = false;
     }
     subscriptionIds.clear();
-    if (!intentionalClose) scheduleReconnect();
+    if (!intentionalClose) {
+      scheduleReconnect();
+    }
   };
 
   ws.onerror = () => {
+    wsError = 'WS error';
     console.warn('[MultiMarketWS] Connection error');
   };
 }
@@ -177,7 +209,8 @@ export function stopMultiMarketScan(): void {
   for (const m of SCANNED_MARKETS) {
     marketData[m.symbol].connected = false;
   }
-  tickCallbacks.clear();
+  // IMPORTANT: Do NOT clear tickCallbacks here.
+  // Each callback owner manages its own lifecycle via the unsubscribe function.
 }
 
 export function getMarketData(symbol: MarketSymbol): MarketData {
@@ -192,7 +225,29 @@ export function isScannerConnected(): boolean {
   return isConnected;
 }
 
+export function getScannerHealth() {
+  const ticksPerMarket: Record<string, number> = {};
+  for (const m of SCANNED_MARKETS) {
+    ticksPerMarket[m.symbol] = marketData[m.symbol].tickCount;
+  }
+  return {
+    isConnected,
+    totalTicksReceived,
+    lastTickTime,
+    connectTime,
+    ticksPerMarket,
+    wsError,
+    callbackCount: tickCallbacks.size,
+  };
+}
+
 export function addTickCallback(cb: OnMarketTickCallback): () => void {
   tickCallbacks.add(cb);
-  return () => tickCallbacks.delete(cb);
+  return () => { tickCallbacks.delete(cb); };
+}
+
+export function resetMarketData(): void {
+  marketData = initMarketData();
+  totalTicksReceived = 0;
+  lastTickTime = 0;
 }

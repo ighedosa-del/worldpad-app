@@ -5,12 +5,22 @@ import { useWorldpadStore } from '@/lib/store';
 import { useTradeExecution } from '@/hooks/use-trade-execution';
 import {
   startMultiMarketScan, stopMultiMarketScan, getAllMarketData,
-  getMarketData, isScannerConnected, addTickCallback,
+  getMarketData, isScannerConnected, addTickCallback, getScannerHealth,
   SCANNED_MARKETS, type MarketData, type MarketSymbol, type MarketTickData,
 } from '@/lib/multi-market-ws';
 import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
-import { isSimulating, getProposalWS, buyContractWS } from '@/lib/deriv-ws';
+import { isSimulating } from '@/lib/deriv-ws';
+
+export interface ScannerHealth {
+  isConnected: boolean;
+  totalTicksReceived: number;
+  lastTickTime: number;
+  connectTime: number;
+  ticksPerMarket: Record<string, number>;
+  wsError: string | null;
+  callbackCount: number;
+}
 
 export interface AIBotState {
   isRunning: boolean;
@@ -20,6 +30,7 @@ export interface AIBotState {
   totalTradesPlaced: number;
   totalProfit: number;
   scannerConnected: boolean;
+  scannerHealth: ScannerHealth;
   lastCycleTime: number;
   status: 'idle' | 'scanning' | 'trading' | 'waiting';
 }
@@ -34,6 +45,10 @@ export function useAIBot() {
   // State
   const [rankedMarkets, setRankedMarkets] = useState<RankedMarket[]>([]);
   const [scannerConnected, setScannerConnected] = useState(false);
+  const [scannerHealth, setScannerHealth] = useState<ScannerHealth>({
+    isConnected: false, totalTicksReceived: 0, lastTickTime: 0,
+    connectTime: 0, ticksPerMarket: {}, wsError: null, callbackCount: 0,
+  });
   const [isRunning, setIsRunning] = useState(false);
   const [status, setStatus] = useState<AIBotState['status']>('idle');
   const [cycleCount, setCycleCount] = useState(0);
@@ -48,38 +63,70 @@ export function useAIBot() {
   const totalProfitRef = useRef(0);
   const tickDataRef = useRef<Map<string, MarketTickData | null>>(new Map());
   const lastRankingRef = useRef<RankedMarket[]>([]);
+  const mountedRef = useRef(true);
 
   // Initialize tick data map
   for (const m of SCANNED_MARKETS) {
     tickDataRef.current.set(m.symbol, null);
   }
 
-  // Tick callback — updates live data and feeds AI
-  useEffect(() => {
-    const unsubscribe = addTickCallback((symbol, data) => {
-      tickDataRef.current.set(symbol, data.lastTick);
-
-      // Feed to AI engine for learning
-      feedTickToAI(symbol, data);
-
-      // Update ranking every ~500ms (always, not just when running)
-      updateRanking();
-    });
-    return unsubscribe;
-  }, []);
-
-  // Update market rankings (throttled)
-  const rankingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const updateRanking = useCallback(() => {
-    if (rankingTimerRef.current) return;
-    rankingTimerRef.current = setTimeout(() => {
-      rankingTimerRef.current = null;
+  // === CORE: Force re-score all markets ===
+  const doUpdateRanking = useCallback(() => {
+    try {
       const allData = Object.values(getAllMarketData());
       const ranked = scoreAllMarkets(allData);
       lastRankingRef.current = ranked;
-      setRankedMarkets(ranked);
-    }, 500);
+      if (mountedRef.current) {
+        setRankedMarkets(ranked);
+      }
+    } catch (err) {
+      console.error('[AIBot] Ranking error:', err);
+    }
   }, []);
+
+  // Throttled version for tick callbacks (max once per 500ms)
+  const rankingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updateRankingThrottled = useCallback(() => {
+    if (rankingTimerRef.current) return;
+    rankingTimerRef.current = setTimeout(() => {
+      rankingTimerRef.current = null;
+      doUpdateRanking();
+    }, 500);
+  }, [doUpdateRanking]);
+
+  // Tick callback — feeds AI + triggers ranking
+  useEffect(() => {
+    const unsubscribe = addTickCallback((symbol, data) => {
+      tickDataRef.current.set(symbol, data.lastTick);
+      feedTickToAI(symbol, data);
+      updateRankingThrottled();
+    });
+    return unsubscribe;
+  }, [updateRankingThrottled]);
+
+  // === FALLBACK: Poll every 1 second to force re-score ===
+  // This ensures the UI updates even if the tick callback chain breaks.
+  // It also updates connection health and forces a re-render.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!mountedRef.current) return;
+
+      // Update connection status
+      const connected = isScannerConnected();
+      setScannerConnected(connected);
+
+      // Update health data (triggers re-render with fresh market data)
+      const health = getScannerHealth();
+      setScannerHealth(health);
+
+      // Force re-score on every poll tick
+      // This is the KEY FIX: even if no tick callbacks fire,
+      // we still score the markets every second.
+      doUpdateRanking();
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [doUpdateRanking]);
 
   // Execute a trade on a specific market
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
@@ -154,7 +201,7 @@ export function useAIBot() {
     setStatus('waiting');
   }, [executeTradeOnMarket, botConfig.stake]);
 
-  // Start the AI bot (scanning starts on mount; START only enables trading)
+  // Start the AI bot
   const startBot = useCallback(() => {
     // Load learning data
     aiEngine.loadLearningData();
@@ -170,10 +217,9 @@ export function useAIBot() {
     const simMode = isSimulating() || !isAuthorized;
     addAutoTraderLog(`[AI] === AI BOT STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic weight 60% + AI weight 40% | Max concurrent: 2`);
+    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score 55 | Max concurrent: 2`);
 
     // Start the trading cycle timer (every 2.5 seconds)
-    // Note: scanning is already running from mount effect
     const runLoop = async () => {
       if (!runningRef.current) return;
       await runCycle();
@@ -184,42 +230,36 @@ export function useAIBot() {
     runLoop();
   }, [isAuthorized, botConfig, addAutoTraderLog, runCycle]);
 
-  // Stop the AI bot
+  // Stop the AI bot — stop trading but KEEP scanning
   const stopBot = useCallback(() => {
     runningRef.current = false;
     setIsRunning(false);
     setStatus('idle');
 
     if (cycleTimerRef.current) { clearTimeout(cycleTimerRef.current); cycleTimerRef.current = null; }
-    if (rankingTimerRef.current) { clearTimeout(rankingTimerRef.current); rankingTimerRef.current = null; }
 
+    // Stop and restart scanning (clears stale data, reconnects fresh)
     stopMultiMarketScan();
-    setScannerConnected(false);
+    setTimeout(() => {
+      if (mountedRef.current) {
+        startMultiMarketScan();
+      }
+    }, 500);
+
     activeTradesRef.current.clear();
 
     addAutoTraderLog(`[AI] === AI BOT STOPPED === | Cycles: ${cycleCount} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     aiEngine.saveLearningData();
-    // Restart scanning (keep data flowing, just stop trading)
-    startMultiMarketScan();
   }, [addAutoTraderLog, cycleCount]);
 
-  // Track scanner connection + auto-start scanning on mount
+  // Start scanning on mount
   useEffect(() => {
-    // Start scanning immediately (data collection, no trading)
+    mountedRef.current = true;
     startMultiMarketScan();
     aiEngine.loadLearningData();
 
-    const interval = setInterval(() => {
-      setScannerConnected(isScannerConnected());
-    }, 1000);
     return () => {
-      clearInterval(interval);
-    };
-  }, []);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
+      mountedRef.current = false;
       runningRef.current = false;
       if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
       if (rankingTimerRef.current) clearTimeout(rankingTimerRef.current);
@@ -231,6 +271,7 @@ export function useAIBot() {
     isRunning,
     rankedMarkets,
     scannerConnected,
+    scannerHealth,
     status,
     cycleCount,
     totalTradesPlaced,
