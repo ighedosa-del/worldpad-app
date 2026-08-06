@@ -81,6 +81,14 @@ export interface AuthorizeResult {
   accountType: 'demo' | 'real';
 }
 
+// v5: Restore credentials from store (called on page reload)
+export function restoreCredentials(patToken: string, appId: string, accountId: string) {
+  storedPatToken = patToken;
+  storedAppId = appId;
+  storedAccountId = accountId;
+  console.log('[DerivWS] Credentials restored from storage');
+}
+
 // ---- AUTH FLOW: REST OTP ----
 
 export async function getDerivAccounts(patToken: string, appId: string): Promise<DerivAccount[]> {

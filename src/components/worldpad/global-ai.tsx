@@ -10,7 +10,8 @@ import {
 import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
 import { calculateStake, recordRiskResult, resetRiskStates, getSessionPL } from '@/lib/risk-manager';
-import { isSimulating, getProposalWS, buyContractWS } from '@/lib/deriv-ws';
+import { checkLiveTrade, recordLiveTrade, resetLiveSession, getLiveStats, preFlightCheck } from '@/lib/real-money-guard';
+import { getProposalWS, buyContractWS, restoreCredentials } from '@/lib/deriv-ws';
 import type { TradeResult } from '@/hooks/use-trade-execution';
 import { clearPendingSimTrades } from '@/hooks/use-trade-execution';
 
@@ -77,7 +78,11 @@ async function placeTradeDirect(params: {
   stake: number;
   symbol: string;
 }): Promise<TradeResult | null> {
-  const simMode = isSimulating() || !useWorldpadStore.getState().isAuthorized;
+  // v5 FIX: Only check isAuthorized. isSimulating() refers to the single-market WS
+  // which is irrelevant — GlobalAI uses multi-market-ws for ticks (always real data).
+  const authorized = useWorldpadStore.getState().isAuthorized;
+  const simMode = !authorized;
+  console.log('[GlobalAI] placeTradeDirect: isAuthorized=', authorized, 'simMode=', simMode);
 
   if (simMode) {
     if (pendingSimTradesGlobal.has(params.symbol)) return null;
@@ -224,17 +229,38 @@ export function GlobalAI() {
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
     if (!market.selectedSignal) return;
     if (tradeLocksRef.current.has(market.symbol)) return;
+
+    // v5: Real Money Guard — check safety rules
+    // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+    const simMode = !isAuthorized;
+    const guardResult = checkLiveTrade(stake, !simMode);
+    if (!guardResult.allowed) {
+      addAutoTraderLog(`[AI] BLOCKED: ${guardResult.reason}`);
+      if (guardResult.warnings.length > 0) {
+        for (const w of guardResult.warnings) addAutoTraderLog(`[AI] WARNING: ${w}`);
+      }
+      return;
+    }
+    if (guardResult.warnings.length > 0) {
+      for (const w of guardResult.warnings) addAutoTraderLog(`[AI] WARNING: ${w}`);
+    }
+
     tradeLocksRef.current.add(market.symbol);
 
     try {
       const signal = market.selectedSignal;
       // v4: Dynamic stake via Kelly criterion
       const { stake: kellyStake, reason: stakeReason } = calculateStake(
-        market.symbol, signal.contractType, 0.90, { baseStake: stake }
+        market.symbol, signal.contractType, 0.90, { baseStake: guardResult.cappedStake }
       );
-      const finalStake = kellyStake > 0 ? kellyStake : stake;
+      let finalStake = kellyStake > 0 ? kellyStake : guardResult.cappedStake;
 
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)} | ${stakeReason}`;
+      // v5: Re-apply live stake caps after Kelly adjustment
+      if (!simMode) {
+        finalStake = Math.max(0.35, Math.min(5.0, finalStake));
+      }
+
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)}${!simMode ? ' LIVE' : ''} | ${signal.reason} | score ${market.combinedScore.toFixed(0)} | ${stakeReason}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -249,6 +275,22 @@ export function GlobalAI() {
       if (result) {
         const won = result.profit > 0;
 
+        // v5: Record live trade for safety tracking
+        if (!simMode) {
+          const liveResult = recordLiveTrade(result.profit);
+          if (liveResult.shouldPause) {
+            addAutoTraderLog(`[AI] PAUSED: ${liveResult.message}`);
+          }
+          if (liveResult.shouldStop) {
+            addAutoTraderLog(`[AI] HARD STOP: ${liveResult.message}`);
+            runningRef.current = false;
+            setGlobalAIRunning(false);
+            setGlobalAIStatus('idle');
+            aiEngine.saveLearningData();
+            return;
+          }
+        }
+
         // v2: Per-market loss cooldown
         if (!won) {
           const ct = marketTickCountsGlobal.get(market.symbol) || 0;
@@ -261,8 +303,8 @@ export function GlobalAI() {
         }
 
         addAutoTraderLog(won
-          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current}`
-          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks`);
+          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current}${!simMode ? ' [LIVE]' : ''}`
+          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinsRef.current} L:${sessionLossesRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks${!simMode ? ' [LIVE]' : ''}`);
 
         aiEngine.recordTradeResult(
           market.symbol, signal.contractType, signal.barrier,
@@ -298,7 +340,7 @@ export function GlobalAI() {
       activeTradesRef.current.delete(market.symbol);
       tradeLocksRef.current.delete(market.symbol);
     }
-  }, [addAutoTraderLog, addTradeResult, setGlobalAITotalTrades, setGlobalAITotalProfit, setGlobalAILearningStats]);
+  }, [isAuthorized, addAutoTraderLog, addTradeResult, setGlobalAITotalTrades, setGlobalAITotalProfit, setGlobalAILearningStats]);
 
   // === Main AI cycle ===
   const runCycle = useCallback(async () => {
@@ -364,13 +406,38 @@ export function GlobalAI() {
     setGlobalAITotalTrades(0);
     setGlobalAITotalProfit(0);
 
-    const simMode = isSimulating() || !isAuthorized;
-    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === GLOBAL AI v4 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
-    addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 50% + AI 30% + Patterns 20% | Regime filter ON | Backtest ON`);
-    addAutoTraderLog(`[AI] Kelly staking | Strategy rotation | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks`);
-    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+    const simMode = !isAuthorized;
+
+    // v5: Pre-flight safety check for live trading
+    if (!simMode) {
+      const preflight = preFlightCheck(true);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+      addAutoTraderLog(`[AI] === GLOBAL AI v5 STARTED === (LIVE MODE)`);
+      addAutoTraderLog(`[AI] REAL MONEY GUARD ACTIVE`);
+      addAutoTraderLog(`[AI] Min stake: $0.35 | Max stake: $5.00`);
+      addAutoTraderLog(`[AI] Session stop-loss: $10 | Daily stop-loss: $25`);
+      addAutoTraderLog(`[AI] Auto-pause after 5 consecutive losses (30s cooldown)`);
+      addAutoTraderLog(`[AI] Auto-evaluate every 50 live trades`);
+      if (!preflight.allowed) {
+        addAutoTraderLog(`[AI] BLOCKED: ${preflight.reason}`);
+        runningRef.current = false;
+        setGlobalAIRunning(false);
+        addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+        return;
+      }
+      addAutoTraderLog(`[AI] Preflight: ${preflight.reason}`);
+      const stats = getLiveStats();
+      addAutoTraderLog(`[AI] Live session: ${stats.totalLiveTrades} trades | P/L: ${stats.totalLiveProfit >= 0 ? '+' : ''}$${stats.totalLiveProfit.toFixed(2)}`);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    } else {
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+      addAutoTraderLog(`[AI] === GLOBAL AI v5 STARTED === (SIMULATION)`);
+      addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
+      addAutoTraderLog(`[AI] Logic 50% + AI 30% + Patterns 20% | Regime filter ON | Backtest ON`);
+      addAutoTraderLog(`[AI] Kelly staking | Strategy rotation | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks`);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    }
 
     const runLoop = async () => {
       if (!runningRef.current) return;
@@ -392,7 +459,7 @@ export function GlobalAI() {
     tradeLocksRef.current.clear();
     pendingSimTradesGlobal.clear();
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === GLOBAL AI v4 STOPPED ===`);
+    addAutoTraderLog(`[AI] === GLOBAL AI v5 STOPPED ===`);
     addAutoTraderLog(`[AI] Cycles: ${cycleCountRef.current} | Trades: ${totalTradesRef.current} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     addAutoTraderLog(`[AI] Session W/L: ${sessionWinsRef.current}/${sessionLossesRef.current}`);
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
@@ -411,6 +478,16 @@ export function GlobalAI() {
     aiEngine.loadLearningData();
     setGlobalAILearningStats(aiEngine.getLearningStats());
     startMultiMarketScan();
+
+    // v5: Restore Deriv credentials from persisted store so trades work after reload
+    const store = useWorldpadStore.getState();
+    if (store.isAuthorized && store.selectedAccountId) {
+      const token = store.accountMode === 'demo' ? store.demoToken : store.realToken;
+      if (token && store.derivAppId) {
+        restoreCredentials(token, store.derivAppId, store.selectedAccountId);
+        console.log('[GlobalAI] Restored Deriv credentials for', store.accountMode, 'trading');
+      }
+    }
 
     const autoStartTimer = setTimeout(() => {
       if (mountedRef.current && !runningRef.current) {

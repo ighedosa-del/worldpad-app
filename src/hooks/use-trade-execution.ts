@@ -2,7 +2,7 @@
 
 import { useCallback } from 'react';
 import { useWorldpadStore } from '@/lib/store';
-import { isSimulating, getProposalWS, buyContractWS } from '@/lib/deriv-ws';
+import { getProposalWS, buyContractWS } from '@/lib/deriv-ws';
 import { addTickCallback, type MarketSymbol } from '@/lib/multi-market-ws';
 
 export interface TradeParams {
@@ -106,7 +106,10 @@ export function useTradeExecution() {
 
   const placeTrade = useCallback(async (params: TradeParams): Promise<TradeResult | null> => {
     const tradeSymbol = params.symbol || activeMarket;
-    const simMode = isSimulating() || !isAuthorized;
+    // v5 FIX: Only check isAuthorized. isSimulating() refers to the single-market WS
+    // which is irrelevant — GlobalAI/multi-market uses multi-market-ws for ticks.
+    const simMode = !isAuthorized;
+    console.log('[TradeExec] placeTrade simMode=', simMode, 'isAuthorized=', isAuthorized);
 
     try {
       if (simMode) {

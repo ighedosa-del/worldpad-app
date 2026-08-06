@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { useWorldpadStore } from '@/lib/store';
-import { connectDerivWS, switchSymbol, disconnectDerivWS, isSimulating } from '@/lib/deriv-ws';
+import { connectDerivWS, switchSymbol, disconnectDerivWS } from '@/lib/deriv-ws';
 
 export function useDerivConnection() {
   const store = useWorldpadStore();
@@ -100,5 +100,5 @@ export function useDerivConnection() {
     }
   }, [activeMarket, store.isConnected]);
 
-  return { isConnected: store.isConnected, isSimulating: isSimulating() };
+  return { isConnected: store.isConnected, isSimulating: !store.isAuthorized };
 }

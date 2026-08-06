@@ -4,7 +4,6 @@ import { useState, useCallback } from 'react';
 import { Zap, Sparkles, Pencil, Flame, CheckCircle2, Smile, Square } from 'lucide-react';
 import { useWorldpadStore } from '@/lib/store';
 import { useBotRunner } from '@/hooks/use-bot-runner';
-import { isSimulating } from '@/lib/deriv-ws';
 
 interface BotCard {
   id: string;
@@ -36,7 +35,8 @@ export function FreeBots() {
   const [loginRequired, setLoginRequired] = useState<string | null>(null);
   const { activeBotId, setActiveBotId, setActiveBotStrategy, setActiveTab, addAutoTraderLog, isBotRunning } = useWorldpadStore();
   const { startBot, stopBot } = useBotRunner();
-  const simMode = isSimulating();
+  // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+  const simMode = !useWorldpadStore.getState().isAuthorized;
 
   const handleRunBot = useCallback((bot: BotCard) => {
     setLoginRequired(null);

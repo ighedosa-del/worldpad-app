@@ -4,7 +4,7 @@ import { useCallback, useRef, useEffect } from 'react';
 import { useWorldpadStore } from '@/lib/store';
 import { useTradeExecution } from '@/hooks/use-trade-execution';
 import { FREE_BOT_STRATEGIES, getBotBuilderSignal, TradeSignal } from '@/lib/bot-engine';
-import { isSimulating } from '@/lib/deriv-ws';
+
 
 export function useBotRunner() {
   const store = useWorldpadStore();
@@ -145,7 +145,8 @@ export function useBotRunner() {
     consecutiveErrorsRef.current = 0;
     tradeInProgressRef.current = false;
 
-    const simMode = isSimulating() || !store.isAuthorized;
+    // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+    const simMode = !store.isAuthorized;
     addAutoTraderLog(`[BOT] Starting bot${activeBotId ? ` (${activeBotId})` : ''}... (${simMode ? 'SIMULATION' : 'LIVE'})`);
     addAutoTraderLog(`[BOT] Stake: $${botConfig.stake} | Martingale: x${botConfig.martingale} | Stop Loss: $${botConfig.stopLoss} | Target: $${botConfig.expectedProfit}`);
 

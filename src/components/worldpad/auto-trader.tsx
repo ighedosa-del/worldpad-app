@@ -4,7 +4,6 @@ import { useWorldpadStore } from '@/lib/store';
 import { useState, useRef, useCallback, useMemo } from 'react';
 import { Play, Zap, Sparkles, Bot, Square } from 'lucide-react';
 import { useBotRunner } from '@/hooks/use-bot-runner';
-import { isSimulating } from '@/lib/deriv-ws';
 
 const LOG_ENTRIES = [
   { type: 'INFO', msg: 'Worldpad Auto Trader v2.4.1 initializing...' },
@@ -81,7 +80,8 @@ export function AutoTrader() {
     botTradeCount, botSessionProfit, botConsecutiveLosses, botConfig,
   } = useWorldpadStore();
   const { startBot, stopBot } = useBotRunner();
-  const simMode = isSimulating();
+  // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+  const simMode = !useWorldpadStore.getState().isAuthorized;
 
   const bootLogs = useMemo(() => createBootLogs(), []);
   const [liveLogs, setLiveLogs] = useState<Array<{ time: string; type: LogType; msg: string }>>([]);

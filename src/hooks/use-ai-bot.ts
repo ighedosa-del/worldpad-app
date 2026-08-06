@@ -10,7 +10,7 @@ import {
 } from '@/lib/multi-market-ws';
 import { aiEngine } from '@/lib/ai-engine';
 import { scoreAllMarkets, selectTrades, feedTickToAI, type RankedMarket } from '@/lib/market-scorer';
-import { isSimulating } from '@/lib/deriv-ws';
+import { checkLiveTrade, recordLiveTrade, getLiveStats, preFlightCheck } from '@/lib/real-money-guard';
 
 export interface ScannerHealth {
   isConnected: boolean;
@@ -162,12 +162,29 @@ export function useAIBot() {
   const executeTradeOnMarket = useCallback(async (market: RankedMarket, stake: number) => {
     if (!market.selectedSignal) return;
     if (tradeLocksRef.current.has(market.symbol)) return;
+
+    // v5: Real Money Guard
+    // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+    const simMode = !isAuthorized;
+    const guardResult = checkLiveTrade(stake, !simMode);
+    if (!guardResult.allowed) {
+      addAutoTraderLog(`[AI] BLOCKED: ${guardResult.reason}`);
+      if (guardResult.warnings.length > 0) {
+        for (const w of guardResult.warnings) addAutoTraderLog(`[AI] WARNING: ${w}`);
+      }
+      return;
+    }
+    if (guardResult.warnings.length > 0) {
+      for (const w of guardResult.warnings) addAutoTraderLog(`[AI] WARNING: ${w}`);
+    }
+
+    const finalStake = guardResult.cappedStake;
     tradeLocksRef.current.add(market.symbol);
 
     try {
       const signal = market.selectedSignal;
       const evStr = market.evAdjusted ? ` [EV: ${market.expectedValue.toFixed(3)}]` : '';
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${stake.toFixed(2)} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}${evStr}`;
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)}${!simMode ? ' LIVE' : ''} | ${signal.reason} | score ${market.combinedScore.toFixed(0)}${evStr}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -175,7 +192,7 @@ export function useAIBot() {
       const result = await placeTrade({
         contractType: signal.contractType,
         barrier: signal.barrier,
-        stake,
+        stake: finalStake,
         symbol: market.symbol,
         duration: 1,
         durationUnit: 't',
@@ -183,6 +200,22 @@ export function useAIBot() {
 
       if (result) {
         const won = result.profit > 0;
+
+        // v5: Record live trade for safety tracking
+        if (!simMode) {
+          const liveResult = recordLiveTrade(result.profit);
+          if (liveResult.shouldPause) {
+            addAutoTraderLog(`[AI] PAUSED: ${liveResult.message}`);
+          }
+          if (liveResult.shouldStop) {
+            addAutoTraderLog(`[AI] HARD STOP: ${liveResult.message}`);
+            runningRef.current = false;
+            setIsRunning(false);
+            setStatus('stopped');
+            aiEngine.saveLearningData();
+            return;
+          }
+        }
 
         // v2: Per-market loss cooldown
         if (!won) {
@@ -197,8 +230,8 @@ export function useAIBot() {
         }
 
         const logResult = won
-          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current}`
-          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks`;
+          ? `[AI] WIN  ${market.name}: +$${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current}${!simMode ? ' [LIVE]' : ''}`
+          : `[AI] LOSS ${market.name}: $${result.profit.toFixed(2)} | W:${sessionWinCountRef.current} L:${sessionLossCountRef.current} | cooldown ${LOSS_COOLDOWN_TICKS} ticks${!simMode ? ' [LIVE]' : ''}`;
         addAutoTraderLog(logResult);
 
         // Record to AI engine for learning
@@ -212,8 +245,8 @@ export function useAIBot() {
           id: `ai-${Date.now()}-${market.symbol}`,
           type: signal.contractType,
           symbol: market.symbol,
-          stake,
-          payout: result.payout || stake * 0.85,
+          stake: finalStake,
+          payout: result.payout || finalStake * 0.85,
           profit: result.profit,
           digit: signal.barrier ?? -1,
           won,
@@ -230,7 +263,7 @@ export function useAIBot() {
       activeTradesRef.current.delete(market.symbol);
       tradeLocksRef.current.delete(market.symbol);
     }
-  }, [placeTrade, addAutoTraderLog, addTradeResult, startCooldown]);
+  }, [isAuthorized, placeTrade, addAutoTraderLog, addTradeResult, startCooldown]);
 
   // v2: Stop-loss check
   const isStopLossHit = useCallback((): boolean => {
@@ -300,13 +333,36 @@ export function useAIBot() {
     setCycleCount(0);
     setTotalTradesPlaced(0);
     activeTradesRef.current.clear();
-    const simMode = isSimulating() || !isAuthorized;
-    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === AI BOT v2 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
-    addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-    addAutoTraderLog(`[AI] Logic 60% + AI 40% | Min score: 30 | Max concurrent: 10`);
-    addAutoTraderLog(`[AI] v2: EV filtering ON | MATCH penalty ON | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks | Consensus bonus ON`);
-    addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    // v5 FIX: Only check isAuthorized (isSimulating checks wrong WS)
+    const simMode = !isAuthorized;
+
+    // v5: Pre-flight safety check for live trading
+    if (!simMode) {
+      const preflight = preFlightCheck(true);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+      addAutoTraderLog(`[AI] === AI BOT v5 STARTED === (LIVE MODE)`);
+      addAutoTraderLog(`[AI] REAL MONEY GUARD ACTIVE`);
+      addAutoTraderLog(`[AI] Min stake: $0.35 | Max stake: $5.00`);
+      addAutoTraderLog(`[AI] Session stop-loss: $10 | Daily stop-loss: $25`);
+      addAutoTraderLog(`[AI] Auto-pause after 5 consecutive losses (30s cooldown)`);
+      if (!preflight.allowed) {
+        addAutoTraderLog(`[AI] BLOCKED: ${preflight.reason}`);
+        runningRef.current = false;
+        setIsRunning(false);
+        addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+        return;
+      }
+      const stats = getLiveStats();
+      addAutoTraderLog(`[AI] Live session: ${stats.totalLiveTrades} trades | P/L: ${stats.totalLiveProfit >= 0 ? '+' : ''}$${stats.totalLiveProfit.toFixed(2)}`);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    } else {
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+      addAutoTraderLog(`[AI] === AI BOT v5 STARTED === (${simMode ? 'SIMULATION' : 'LIVE'})`);
+      addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
+      addAutoTraderLog(`[AI] Logic 50% + AI 30% + Patterns 20% | Regime filter ON | Backtest ON`);
+      addAutoTraderLog(`[AI] v5: EV filtering | Kelly staking | Strategy rotation | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks`);
+      addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+    }
 
     const runLoop = async () => {
       if (!runningRef.current) return;
@@ -331,7 +387,7 @@ export function useAIBot() {
     }, 500);
     activeTradesRef.current.clear();
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-    addAutoTraderLog(`[AI] === AI BOT v2 STOPPED ===`);
+    addAutoTraderLog(`[AI] === AI BOT v5 STOPPED ===`);
     addAutoTraderLog(`[AI] Cycles: ${cycleCount} | Trades: ${totalTradesPlaced} | P/L: ${totalProfitRef.current >= 0 ? '+' : ''}$${totalProfitRef.current.toFixed(2)}`);
     addAutoTraderLog(`[AI] Session W/L: ${sessionWinCountRef.current}/${sessionLossCountRef.current}`);
     addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
