@@ -59,13 +59,13 @@ class AIEngine {
     if (typeof window === 'undefined') return;
     try {
       const LEARNING_VERSION = 2; // bump this to force a brain wipe
-      const saved = localStorage.getItem('wp-ai-learning');
+      const saved = localStorage.getItem('wp-ai-learning-v2');
       if (saved) {
         const data = JSON.parse(saved);
         // If version mismatch or no version field, wipe old data
         if ((data.version || 1) < LEARNING_VERSION) {
           console.log(`[AI] Wiping old v${data.version || 1} learning data (incompatible with v2 engine)`);
-          localStorage.removeItem('wp-ai-learning');
+          localStorage.removeItem('wp-ai-learning-v2');
           return;
         }
         if (data.strategyStats) {
@@ -86,7 +86,7 @@ class AIEngine {
         strategyStats: Object.fromEntries(this.strategyStats),
         totalTradesRecorded: this.totalTradesRecorded,
       };
-      localStorage.setItem('wp-ai-learning', JSON.stringify(data));
+      localStorage.setItem('wp-ai-learning-v2', JSON.stringify(data));
     } catch { /* ignore */ }
   }
 

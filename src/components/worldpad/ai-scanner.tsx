@@ -207,7 +207,7 @@ function LearningPanel({ learningStats }: { learningStats: { strategiesLearned: 
 
   const handleClearBrain = () => {
     if (typeof window !== 'undefined') {
-      localStorage.removeItem('wp-ai-learning');
+      localStorage.removeItem('wp-ai-learning-v2');
       setCleared(true);
       setTimeout(() => setCleared(false), 3000);
     }
