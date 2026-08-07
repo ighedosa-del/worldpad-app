@@ -263,7 +263,7 @@ export function GlobalAI() {
         finalStake = Math.max(0.35, Math.min(5.0, finalStake));
       }
 
-      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)}${!simMode ? ' LIVE' : ''} | ${signal.reason} | score ${market.combinedScore.toFixed(0)} | ${stakeReason}`;
+      const logMsg = `[AI] ${market.name}: ${signal.contractType} d${signal.barrier ?? '-'} @ $${finalStake.toFixed(2)}${simMode ? ' ⚠️SIM' : ' LIVE'} | ${signal.reason} | score ${market.combinedScore.toFixed(0)} | ${stakeReason}`;
       addAutoTraderLog(logMsg);
 
       activeTradesRef.current.set(market.symbol, { signal, startedAt: Date.now() });
@@ -435,11 +435,11 @@ export function GlobalAI() {
       addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
     } else {
       addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
-      addAutoTraderLog(`[AI] === GLOBAL AI v5 STARTED === (SIMULATION)`);
-      addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
-      addAutoTraderLog(`[AI] Logic 50% + AI 30% + Patterns 20% | Regime filter ON | Backtest ON`);
-      addAutoTraderLog(`[AI] Kelly staking | Strategy rotation | Loss cooldown: ${LOSS_COOLDOWN_TICKS} ticks`);
+      addAutoTraderLog(`[AI] ⚠️  SIMULATION MODE — NOT connected to Deriv`);
+      addAutoTraderLog(`[AI] ⚠️  Trades are FAKE — no real money used`);
+      addAutoTraderLog(`[AI] ⚠️  Click CONNECT ACCOUNT to trade for real`);
       addAutoTraderLog(`[AI] ═══════════════════════════════════════`);
+      addAutoTraderLog(`[AI] Scanning ${SCANNED_MARKETS.length} markets | Stake: $${botConfig.stake} | Stop Loss: $${botConfig.stopLoss}`);
     }
 
     const runLoop = async () => {
