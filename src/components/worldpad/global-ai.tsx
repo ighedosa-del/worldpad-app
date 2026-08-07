@@ -106,6 +106,7 @@ async function placeTradeDirect(params: {
   // LIVE mode — sending real trade to Deriv
   try {
     console.log('[GlobalAI] LIVE TRADE — sending to Deriv WS (ready:', wsStatus.wsReady, 'token:', wsStatus.tokenPreview, ')');
+    useWorldpadStore.getState().addAutoTraderLog(`[AI] 🔄 Connecting to Deriv trade server...`);
     const proposal = await getProposalWS({
       contractType: params.contractType,
       symbol: params.symbol,
@@ -114,8 +115,10 @@ async function placeTradeDirect(params: {
       duration: 1,
       durationUnit: 't',
     });
+    useWorldpadStore.getState().addAutoTraderLog(`[AI] ✅ Proposal OK — payout $${proposal.payout.toFixed(2)}, buying...`);
     const buyResult = await buyContractWS(proposal.id, proposal.ask_price);
     const won = buyResult.profit > 0;
+    useWorldpadStore.getState().addAutoTraderLog(`[AI] ✅ BUY FILLED — contract ${buyResult.contract_id} | ${won ? '+$' : '-$'}${Math.abs(buyResult.profit).toFixed(2)} ${won ? 'WIN' : 'LOSS'} [LIVE ON DERIV]`);
     return {
       id: buyResult.contract_id,
       type: params.contractType,
@@ -129,7 +132,10 @@ async function placeTradeDirect(params: {
       simulated: false,
     };
   } catch (err) {
-    console.error('[GlobalAI] Live trade error:', err);
+    const errMsg = (err as Error).message || String(err);
+ console.error('[GlobalAI] Live trade error:', errMsg);
+    useWorldpadStore.getState().addAutoTraderLog(`[AI] ❌ LIVE TRADE FAILED: ${errMsg}`);
+    useWorldpadStore.getState().addAutoTraderLog(`[AI] ❌ Check: App ID correct? PAT token has Trade scope? Account ID matches?`);
     return null;
   }
 }
@@ -336,6 +342,9 @@ export function GlobalAI() {
           setGlobalAITotalProfit(totalProfitRef.current);
           setGlobalAILearningStats(aiEngine.getLearningStats());
         }
+      } else if (!simMode) {
+        // Trade returned null in LIVE mode — error already logged in placeTradeDirect
+        addAutoTraderLog(`[AI] ⚠️ Trade on ${market.name} returned no result (live path failed — see error above)`);
       }
     } catch (err) {
       addAutoTraderLog(`[AI] Error on ${market.name}: ${(err as Error).message}`);
@@ -534,6 +543,21 @@ export function GlobalAI() {
     }, 1000);
     return () => clearInterval(interval);
   }, [setGlobalAIHealth]);
+
+  // v5: Auto-restart bot when user connects mid-session
+  useEffect(() => {
+    if (!isAuthorized) return;
+    if (runningRef.current) return;
+    // User just connected — restart the bot in LIVE mode
+    addAutoTraderLog(`[AI] 🔗 Deriv account connected — restarting bot in LIVE mode...`);
+    const store = useWorldpadStore.getState();
+    const token = store.accountMode === 'demo' ? store.demoToken : store.realToken;
+    if (token && store.derivAppId && store.selectedAccountId) {
+      restoreCredentials(token, store.derivAppId, store.selectedAccountId);
+      addAutoTraderLog(`[AI] ✅ Trade credentials restored for ${store.accountMode} account ${store.selectedAccountId}`);
+    }
+    setTimeout(() => { startBot(); }, 1000);
+  }, [isAuthorized]);
 
   // Listen for trades from ANY tab and feed AI learning
   useEffect(() => {
